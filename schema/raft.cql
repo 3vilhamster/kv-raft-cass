@@ -35,8 +35,8 @@ CREATE TABLE IF NOT EXISTS raft_state (
                                           vote bigint,
                                           commit bigint,
                                           last_updated timestamp,
-                                          PRIMARY KEY (namespace_id)
-) WITH gc_grace_seconds = 3600;
+                                          PRIMARY KEY ((namespace_id), term)
+) WITH CLUSTERING ORDER BY (term DESC) AND gc_grace_seconds = 3600;
 
 -- Configuration state table for cluster membership
 CREATE TABLE IF NOT EXISTS raft_membership (

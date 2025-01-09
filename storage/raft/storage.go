@@ -132,7 +132,8 @@ func (s *Storage) loadLatestSnapshot() (*raftpb.Snapshot, error) {
 	err := s.session.Query(`
 		SELECT snap_index, term, data, conf_state, created_at 
 		FROM raft_snapshots 
-		WHERE namespace_id = ? 
+		WHERE namespace_id = ?
+		ORDER BY snap_index DESC
 		LIMIT 1`,
 		s.namespaceID,
 	).Scan(&snapIndex, &term, &data, &confStateData, &createdAt)
@@ -180,7 +181,7 @@ func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	err := s.session.Query(`
         SELECT term, vote, commit 
         FROM raft_state 
-        WHERE namespace_id = ?`,
+        WHERE namespace_id = ? order by term desc limit 1`,
 		s.namespaceID,
 	).Scan(&term, &vote, &commit)
 
