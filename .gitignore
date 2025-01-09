@@ -17,9 +17,17 @@
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
+docker/out
+
 # Go workspace file
 go.work
 go.work.sum
 
 # env file
 .env
+
+# idea folder
+.idea
+
+# wal files
+.wal

@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/kv-raft-cass.iml" filepath="$PROJECT_DIR$/.idea/kv-raft-cass.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/raftexample.iml" filepath="$PROJECT_DIR$/.idea/raftexample.iml" />
     </modules>
   </component>
 </project>

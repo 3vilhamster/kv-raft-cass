@@ -18,13 +18,13 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
-	"errors"
 	"log"
-	"strings"
 	"sync"
 
+	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
-	"go.etcd.io/raft/v3/raftpb"
+
+	"github.com/3vilhamster/kv-raft-cass/storage"
 )
 
 // a key-value store backed by raft
@@ -32,7 +32,7 @@ type kvstore struct {
 	proposeC    chan<- string // channel for proposing updates
 	mu          sync.RWMutex
 	kvStore     map[string]string // current committed key-value pairs
-	snapshotter *snap.Snapshotter
+	snapshotter storage.Raft
 }
 
 type kv struct {
@@ -40,13 +40,13 @@ type kv struct {
 	Val string
 }
 
-func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
+func newKVStore(snapshotter storage.Raft, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
 	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
 		log.Panic(err)
 	}
-	if snapshot != nil {
+	if snapshot.Size() > 0 {
 		log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
 		if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
 			log.Panic(err)
@@ -65,7 +65,7 @@ func (s *kvstore) Lookup(key string) (string, bool) {
 }
 
 func (s *kvstore) Propose(k string, v string) {
-	var buf strings.Builder
+	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
 		log.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			if err != nil {
 				log.Panic(err)
 			}
-			if snapshot != nil {
+			if snapshot.Size() > 0 {
 				log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
 				if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
 					log.Panic(err)
@@ -112,13 +112,13 @@ func (s *kvstore) getSnapshot() ([]byte, error) {
 	return json.Marshal(s.kvStore)
 }
 
-func (s *kvstore) loadSnapshot() (*raftpb.Snapshot, error) {
-	snapshot, err := s.snapshotter.Load()
-	if errors.Is(err, snap.ErrNoSnapshot) {
-		return nil, nil
+func (s *kvstore) loadSnapshot() (raftpb.Snapshot, error) {
+	snapshot, err := s.snapshotter.Snapshot()
+	if err == snap.ErrNoSnapshot {
+		return snapshot, nil
 	}
 	if err != nil {
-		return nil, err
+		return snapshot, err
 	}
 	return snapshot, nil
 }

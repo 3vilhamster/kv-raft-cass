@@ -21,13 +21,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
+	"github.com/gocql/gocql"
+	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.uber.org/zap/zaptest"
 
-	"go.etcd.io/raft/v3/raftpb"
+	raftstorage "github.com/3vilhamster/kv-raft-cass/storage/raft"
 )
 
 func getSnapshotFn() (func() ([]byte, error), <-chan struct{}) {
@@ -48,10 +49,10 @@ type cluster struct {
 }
 
 // newCluster creates a cluster of n nodes
-func newCluster(n int) *cluster {
+func newCluster(t *testing.T, n int) *cluster {
 	peers := make([]string, n)
 	for i := range peers {
-		peers[i] = fmt.Sprintf("http://127.0.0.1:%d", 10000+i)
+		peers[i] = fmt.Sprintf("http://127.0.0.1:%d", 20000+i)
 	}
 
 	clus := &cluster{
@@ -63,14 +64,39 @@ func newCluster(n int) *cluster {
 		snapshotTriggeredC: make([]<-chan struct{}, len(peers)),
 	}
 
+	clusterConfig := gocql.NewCluster("127.0.0.1")
+	clusterConfig.Keyspace = "raft_storage"
+	// Optimize consistency levels for local datacenter
+	clusterConfig.Consistency = gocql.One
+	// Optimize connection settings for write-heavy workload
+	clusterConfig.NumConns = 1
+	clusterConfig.Timeout = 2 * time.Second
+	clusterConfig.RetryPolicy = &gocql.SimpleRetryPolicy{NumRetries: 2}
+	clusterConfig.PoolConfig.HostSelectionPolicy =
+		gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
+	sess, err := clusterConfig.CreateSession()
+	if err != nil {
+		panic(err)
+	}
+
+	cleanupCassandraState(t, sess)
+
 	for i := range clus.peers {
-		os.RemoveAll(fmt.Sprintf("raftexample-%d", i+1))
-		os.RemoveAll(fmt.Sprintf("raftexample-%d-snap", i+1))
+		err := os.RemoveAll(fmt.Sprintf(".wal/raftexample-%d", i+1))
+		if err != nil {
+			t.Fatal(err)
+		}
 		clus.proposeC[i] = make(chan string, 1)
 		clus.confChangeC[i] = make(chan raftpb.ConfChange, 1)
 		fn, snapshotTriggeredC := getSnapshotFn()
 		clus.snapshotTriggeredC[i] = snapshotTriggeredC
-		clus.commitC[i], clus.errorC[i], _ = newRaftNode(i+1, clus.peers, false, fn, clus.proposeC[i], clus.confChangeC[i])
+
+		storage, err := raftstorage.New(sess, namespaceID, uint64(i+1))
+		if err != nil {
+			panic(err)
+		}
+
+		clus.commitC[i], clus.errorC[i] = newRaftNode(i+1, zaptest.NewLogger(t), storage, clus.peers, false, fn, clus.proposeC[i], clus.confChangeC[i])
 	}
 
 	return clus
@@ -80,7 +106,7 @@ func newCluster(n int) *cluster {
 func (clus *cluster) Close() (err error) {
 	for i := range clus.peers {
 		go func(i int) {
-			for range clus.commitC[i] { //revive:disable-line:empty-block
+			for range clus.commitC[i] {
 				// drain pending commits
 			}
 		}(i)
@@ -91,22 +117,22 @@ func (clus *cluster) Close() (err error) {
 		}
 		// clean intermediates
 		os.RemoveAll(fmt.Sprintf("raftexample-%d", i+1))
-		os.RemoveAll(fmt.Sprintf("raftexample-%d-snap", i+1))
 	}
 	return err
 }
 
 func (clus *cluster) closeNoErrors(t *testing.T) {
 	t.Log("closing cluster...")
-	err := clus.Close()
-	require.NoError(t, err)
+	if err := clus.Close(); err != nil {
+		t.Fatal(err)
+	}
 	t.Log("closing cluster [done]")
 }
 
 // TestProposeOnCommit starts three nodes and feeds commits back into the proposal
 // channel. The intent is to ensure blocking on a proposal won't block raft progress.
 func TestProposeOnCommit(t *testing.T) {
-	clus := newCluster(3)
+	clus := newCluster(t, 3)
 	defer clus.closeNoErrors(t)
 
 	donec := make(chan struct{})
@@ -126,7 +152,7 @@ func TestProposeOnCommit(t *testing.T) {
 				}
 			}
 			donec <- struct{}{}
-			for range cC { //revive:disable-line:empty-block
+			for range cC {
 				// acknowledge the commits from other nodes so
 				// raft continues to make progress
 			}
@@ -143,7 +169,7 @@ func TestProposeOnCommit(t *testing.T) {
 
 // TestCloseProposerBeforeReplay tests closing the producer before raft starts.
 func TestCloseProposerBeforeReplay(t *testing.T) {
-	clus := newCluster(1)
+	clus := newCluster(t, 1)
 	// close before replay so raft never starts
 	defer clus.closeNoErrors(t)
 }
@@ -151,15 +177,11 @@ func TestCloseProposerBeforeReplay(t *testing.T) {
 // TestCloseProposerInflight tests closing the producer while
 // committed messages are being published to the client.
 func TestCloseProposerInflight(t *testing.T) {
-	clus := newCluster(1)
+	clus := newCluster(t, 1)
 	defer clus.closeNoErrors(t)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
 
 	// some inflight ops
 	go func() {
-		defer wg.Done()
 		clus.proposeC[0] <- "foo"
 		clus.proposeC[0] <- "bar"
 	}()
@@ -168,8 +190,6 @@ func TestCloseProposerInflight(t *testing.T) {
 	if c, ok := <-clus.commitC[0]; !ok || c.data[0] != "foo" {
 		t.Fatalf("Commit failed")
 	}
-
-	wg.Wait()
 }
 
 func TestPutAndGetKeyValue(t *testing.T) {
@@ -181,11 +201,29 @@ func TestPutAndGetKeyValue(t *testing.T) {
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)
 
+	clusterConfig := gocql.NewCluster("127.0.0.1")
+	clusterConfig.Keyspace = "raft_storage"
+	clusterConfig.Consistency = gocql.One
+	clusterConfig.NumConns = 1
+	clusterConfig.Timeout = 2 * time.Second
+	clusterConfig.RetryPolicy = &gocql.SimpleRetryPolicy{NumRetries: 2}
+	clusterConfig.PoolConfig.HostSelectionPolicy =
+		gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
+	sess, err := clusterConfig.CreateSession()
+	if err != nil {
+		panic(err)
+	}
+
+	storage, err := raftstorage.New(sess, namespaceID, 1)
+	if err != nil {
+		panic(err)
+	}
+
 	var kvs *kvstore
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC, snapshotterReady := newRaftNode(1, clusters, false, getSnapshot, proposeC, confChangeC)
+	commitC, errorC := newRaftNode(1, zaptest.NewLogger(t), storage, clusters, false, getSnapshot, proposeC, confChangeC)
 
-	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+	kvs = newKVStore(storage, proposeC, commitC, errorC)
 
 	srv := httptest.NewServer(&httpKVAPI{
 		store:       kvs,
@@ -201,36 +239,45 @@ func TestPutAndGetKeyValue(t *testing.T) {
 	body := bytes.NewBufferString(wantValue)
 	cli := srv.Client()
 
-	req, err := http.NewRequest(http.MethodPut, url, body)
-	require.NoError(t, err)
+	req, err := http.NewRequest("PUT", url, body)
+	if err != nil {
+		t.Fatal(err)
+	}
 	req.Header.Set("Content-Type", "text/html; charset=utf-8")
 	_, err = cli.Do(req)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// wait for a moment for processing message, otherwise get would be failed.
 	<-time.After(time.Second)
 
 	resp, err := cli.Get(url)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("response status code:", resp.StatusCode)
 
 	data, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 
-	gotValue := string(data)
-	require.Equalf(t, wantValue, gotValue, "expect %s, got %s", wantValue, gotValue)
+	if gotValue := string(data); wantValue != gotValue {
+		t.Fatalf("expect %s, got %s", wantValue, gotValue)
+	}
 }
 
 // TestAddNewNode tests adding new node to the existing cluster.
 func TestAddNewNode(t *testing.T) {
-	clus := newCluster(3)
+	clus := newCluster(t, 3)
 	defer clus.closeNoErrors(t)
 
-	os.RemoveAll("raftexample-4")
-	os.RemoveAll("raftexample-4-snap")
+	os.RemoveAll(".wal/raftexample-4")
 	defer func() {
-		os.RemoveAll("raftexample-4")
-		os.RemoveAll("raftexample-4-snap")
+		os.RemoveAll(".wal/raftexample-4")
 	}()
 
 	newNodeURL := "http://127.0.0.1:10004"
@@ -246,7 +293,27 @@ func TestAddNewNode(t *testing.T) {
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)
 
-	newRaftNode(4, append(clus.peers, newNodeURL), true, nil, proposeC, confChangeC)
+	clusterConfig := gocql.NewCluster("127.0.0.1")
+	clusterConfig.Keyspace = "raft_storage"
+	// Optimize consistency levels for local datacenter
+	clusterConfig.Consistency = gocql.One
+	// Optimize connection settings for write-heavy workload
+	clusterConfig.NumConns = 1
+	clusterConfig.Timeout = 2 * time.Second
+	clusterConfig.RetryPolicy = &gocql.SimpleRetryPolicy{NumRetries: 2}
+	clusterConfig.PoolConfig.HostSelectionPolicy =
+		gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
+	sess, err := clusterConfig.CreateSession()
+	if err != nil {
+		panic(err)
+	}
+
+	storage, err := raftstorage.New(sess, namespaceID, 4)
+	if err != nil {
+		panic(err)
+	}
+
+	newRaftNode(4, zaptest.NewLogger(t), storage, append(clus.peers, newNodeURL), true, nil, proposeC, confChangeC)
 
 	go func() {
 		proposeC <- "foo"
@@ -267,7 +334,7 @@ func TestSnapshot(t *testing.T) {
 		snapshotCatchUpEntriesN = prevSnapshotCatchUpEntriesN
 	}()
 
-	clus := newCluster(3)
+	clus := newCluster(t, 3)
 	defer clus.closeNoErrors(t)
 
 	go func() {
@@ -283,4 +350,27 @@ func TestSnapshot(t *testing.T) {
 	}
 	close(c.applyDoneC)
 	<-clus.snapshotTriggeredC[0]
+}
+
+func cleanupCassandraState(t *testing.T, client *gocql.Session) {
+	// Truncate all tables in raft_storage
+	keyspace := "raft_storage"
+	var tables []string
+	iter := client.Query(`SELECT table_name 
+            FROM system_schema.tables 
+            WHERE keyspace_name = ?`, keyspace).Iter()
+	var table string
+	for iter.Scan(&table) {
+		tables = append(tables, table)
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("Failed to get tables for keyspace %s: %v", keyspace, err)
+	}
+
+	for _, table := range tables {
+		query := fmt.Sprintf("TRUNCATE %s.%s", keyspace, table)
+		if err := client.Query(query).Exec(); err != nil {
+			t.Fatalf("Failed to truncate table %s.%s: %v", keyspace, table, err)
+		}
+	}
 }

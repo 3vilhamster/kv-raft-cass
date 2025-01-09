@@ -17,8 +17,13 @@ package main
 import (
 	"flag"
 	"strings"
+	"time"
 
-	"go.etcd.io/raft/v3/raftpb"
+	"github.com/gocql/gocql"
+	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.uber.org/zap"
+
+	raftstorage "github.com/3vilhamster/kv-raft-cass/storage/raft"
 )
 
 func main() {
@@ -33,13 +38,38 @@ func main() {
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)
 
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		panic(err)
+	}
+
 	// raft provides a commit stream for the proposals from the http api
 	var kvs *kvstore
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC, snapshotterReady := newRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
 
-	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+	clusterConfig := gocql.NewCluster("127.0.0.1")
+	clusterConfig.Keyspace = "raft_storage"
+	// Optimize consistency levels for local datacenter
+	clusterConfig.Consistency = gocql.One
+	// Optimize connection settings for write-heavy workload
+	clusterConfig.NumConns = 1
+	clusterConfig.Timeout = 2 * time.Second
+	clusterConfig.RetryPolicy = &gocql.SimpleRetryPolicy{NumRetries: 2}
+	clusterConfig.PoolConfig.HostSelectionPolicy =
+		gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
+	sess, err := clusterConfig.CreateSession()
+	if err != nil {
+		panic(err)
+	}
+	storage, err := raftstorage.New(sess, namespaceID, uint64(*id))
+	if err != nil {
+		panic(err)
+	}
+
+	commitC, errorC := newRaftNode(*id, logger, storage, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
+
+	kvs = newKVStore(storage, proposeC, commitC, errorC)
 
 	// the key-value http handler will propose updates to raft
-	serveHTTPKVAPI(kvs, *kvport, confChangeC, errorC)
+	serveHttpKVAPI(kvs, *kvport, confChangeC, errorC)
 }
