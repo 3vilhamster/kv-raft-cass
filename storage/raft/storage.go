@@ -350,19 +350,9 @@ func (s *Storage) Snapshot() (raftpb.Snapshot, error) {
 	s.RLock()
 	defer s.RUnlock()
 
-	// For a fresh cluster or when no snapshot exists, return empty snapshot
+	// For fresh cluster or no snapshot yet
 	if s.snapshot == nil {
-		if s.firstIndex == 1 && s.lastIndex == 1 {
-			// Return empty snapshot for fresh cluster
-			return raftpb.Snapshot{
-				Metadata: raftpb.SnapshotMetadata{
-					Index:     0,
-					Term:      0,
-					ConfState: raftpb.ConfState{},
-				},
-			}, nil
-		}
-		return raftpb.Snapshot{}, raft.ErrSnapshotTemporarilyUnavailable
+		return raftpb.Snapshot{}, nil // Return empty snapshot for new clusters
 	}
 
 	return *s.snapshot, nil
@@ -578,13 +568,13 @@ func (s *Storage) Append(entries []raftpb.Entry) error {
 	first := entries[0].Index
 	last := entries[len(entries)-1].Index
 
-	// Handle initial state
+	// For initial entries
 	if s.lastIndex == 0 {
 		s.firstIndex = first
-		s.lastIndex = first - 1 // Will be updated below
+		s.lastIndex = first - 1
 	}
 
-	// Handle compaction
+	// Ensure entries are in expected range
 	if first <= s.firstIndex {
 		entries = entries[s.firstIndex-first:]
 		if len(entries) == 0 {
@@ -604,17 +594,20 @@ func (s *Storage) Append(entries []raftpb.Entry) error {
             ) VALUES (?, ?, ?, ?, ?, ?)`,
 			s.namespaceID, entry.Index, entry.Term, int(entry.Type), entry.Data, now,
 		)
-	}
 
-	// Update lastIndex before executing batch
-	if last > s.lastIndex {
-		s.lastIndex = last
+		// Update lastIndex as we add entries
+		if entry.Index > s.lastIndex {
+			s.lastIndex = entry.Index
+		}
 	}
 
 	// Execute batch
 	if err := s.session.ExecuteBatch(batch); err != nil {
 		return fmt.Errorf("failed to append entries: %v", err)
 	}
+
+	log.Printf("Appended entries: first=%d last=%d firstIndex=%d lastIndex=%d",
+		first, last, s.firstIndex, s.lastIndex)
 
 	return nil
 }

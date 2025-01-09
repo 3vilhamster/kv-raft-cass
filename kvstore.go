@@ -22,17 +22,16 @@ import (
 	"sync"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
-	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 
 	"github.com/3vilhamster/kv-raft-cass/storage"
 )
 
 // a key-value store backed by raft
 type kvstore struct {
-	proposeC    chan<- string // channel for proposing updates
-	mu          sync.RWMutex
-	kvStore     map[string]string // current committed key-value pairs
-	snapshotter storage.Raft
+	proposeC chan<- string // channel for proposing updates
+	mu       sync.RWMutex
+	kvStore  map[string]string // current committed key-value pairs
+	storage  storage.Raft
 }
 
 type kv struct {
@@ -41,18 +40,28 @@ type kv struct {
 }
 
 func newKVStore(snapshotter storage.Raft, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
-	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
+	s := &kvstore{
+		proposeC: proposeC,
+		kvStore:  make(map[string]string),
+		storage:  snapshotter,
+	}
+
+	// Load snapshot if available
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
-		log.Panic(err)
+		log.Printf("Error loading snapshot: %v", err)
+		return nil
 	}
-	if snapshot.Size() > 0 {
-		log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
+
+	if snapshot.Data != nil {
+		log.Printf("Loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
 		if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
-			log.Panic(err)
+			log.Printf("Error recovering from snapshot: %v", err)
+			return nil
 		}
 	}
-	// read commits from raft into kvStore map until error
+
+	// Start processing commits
 	go s.readCommits(commitC, errorC)
 	return s
 }
@@ -60,11 +69,14 @@ func newKVStore(snapshotter storage.Raft, proposeC chan<- string, commitC <-chan
 func (s *kvstore) Lookup(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	log.Printf("Looking up key: %s", key)
 	v, ok := s.kvStore[key]
+	log.Printf("Lookup result: key=%s found=%v value=%s", key, ok, v)
 	return v, ok
 }
 
 func (s *kvstore) Propose(k string, v string) {
+	log.Printf("Proposing key=%s value=%s", k, v)
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
 		log.Fatal(err)
@@ -80,7 +92,7 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			if err != nil {
 				log.Panic(err)
 			}
-			if snapshot.Size() > 0 {
+			if snapshot.Data != nil {
 				log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
 				if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
 					log.Panic(err)
@@ -113,12 +125,9 @@ func (s *kvstore) getSnapshot() ([]byte, error) {
 }
 
 func (s *kvstore) loadSnapshot() (raftpb.Snapshot, error) {
-	snapshot, err := s.snapshotter.Snapshot()
-	if err == snap.ErrNoSnapshot {
-		return snapshot, nil
-	}
+	snapshot, err := s.storage.Snapshot()
 	if err != nil {
-		return snapshot, err
+		return raftpb.Snapshot{}, err
 	}
 	return snapshot, nil
 }

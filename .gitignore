@@ -29,5 +29,7 @@ go.work.sum
 # idea folder
 .idea
 
+.DS_Store
+
 # wal files
 .wal
