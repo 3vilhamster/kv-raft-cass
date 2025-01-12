@@ -10,7 +10,6 @@ import (
 	"github.com/gocql/gocql"
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
-	"go.etcd.io/etcd/server/v3/wal/walpb"
 
 	"github.com/3vilhamster/kv-raft-cass/storage"
 )
@@ -85,118 +84,36 @@ func New(session *gocql.Session, namespaceID string, nodeID uint64) (*Storage, e
 	return s, nil
 }
 
-func (s *Storage) initIndices() error {
-	// Load the latest snapshot first
-	snapshot, err := s.loadLatestSnapshot()
-	if err != nil {
-		return fmt.Errorf("load snapshot: %w", err)
-	}
-	s.snapshot = snapshot
-
-	// Initialize indices for fresh cluster
-	if snapshot != nil {
-		s.firstIndex = snapshot.Metadata.Index + 1
-		s.lastIndex = snapshot.Metadata.Index
-	} else {
-		s.firstIndex = 1
-		s.lastIndex = 1 // Start with lastIndex=1 for fresh clusters
-	}
-
-	// Get last index from entries
-	var maxIndex uint64
-	err = s.session.Query(`
-        SELECT MAX(snap_index) 
-        FROM raft_entries 
-        WHERE namespace_id = ?`,
-		s.namespaceID,
-	).Scan(&maxIndex)
-
-	if err != nil && err != gocql.ErrNotFound {
-		return fmt.Errorf("get entries: %w", err)
-	}
-
-	// Update lastIndex if we found entries
-	if err != gocql.ErrNotFound && maxIndex > s.lastIndex {
-		s.lastIndex = maxIndex
-	}
-
-	log.Printf("Storage initialized with firstIndex=%d, lastIndex=%d", s.firstIndex, s.lastIndex)
-	return nil
-}
-
-func (s *Storage) loadLatestSnapshot() (*raftpb.Snapshot, error) {
-	var snapIndex, term uint64
-	var data, confStateData []byte
-	var createdAt time.Time
-
-	err := s.session.Query(`
-		SELECT snap_index, term, data, conf_state, created_at 
-		FROM raft_snapshots 
-		WHERE namespace_id = ?
-		ORDER BY snap_index DESC
-		LIMIT 1`,
-		s.namespaceID,
-	).Scan(&snapIndex, &term, &data, &confStateData, &createdAt)
-
-	if err == gocql.ErrNotFound {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get latest snapshot: %w", err)
-	}
-
-	var confState raftpb.ConfState
-	if err := json.Unmarshal(confStateData, &confState); err != nil {
-		return nil, fmt.Errorf("unmarshal constate: %w", err)
-	}
-
-	return &raftpb.Snapshot{
-		Data: data,
-		Metadata: raftpb.SnapshotMetadata{
-			Index:     snapIndex,
-			Term:      term,
-			ConfState: confState,
-		},
-	}, nil
-}
-
 // InitialState implements the raft.Storage interface
 func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	s.RLock()
 	defer s.RUnlock()
 
 	// Default state for fresh cluster
-	hardState := raftpb.HardState{
-		Term:   0,
-		Vote:   0,
-		Commit: 0,
-	}
+	hardState := raftpb.HardState{}
 
-	// For fresh cluster, start with current node as voter
-	confState := raftpb.ConfState{
-		Voters: []uint64{s.nodeID},
-	}
-
-	var term, vote, commit uint64
+	// Get the latest term and commit index
+	var term, commit uint64
 	err := s.session.Query(`
-        SELECT term, vote, commit 
-        FROM raft_state 
-        WHERE namespace_id = ? order by term desc limit 1`,
+        SELECT MAX(term) as term, MAX(snap_index) as commit
+        FROM raft_entries 
+        WHERE namespace_id = ?`,
 		s.namespaceID,
-	).Scan(&term, &vote, &commit)
+	).Scan(&term, &commit)
 
 	if err != nil && err != gocql.ErrNotFound {
-		return raftpb.HardState{}, raftpb.ConfState{}, fmt.Errorf("get state: %w", err)
+		return raftpb.HardState{}, raftpb.ConfState{}, fmt.Errorf("get max indices: %w", err)
 	}
 
-	// If we found existing state, use it
-	if err == nil {
+	// For joining nodes, use the latest known state
+	if err == nil && commit > 0 {
 		hardState.Term = term
-		hardState.Vote = vote
 		hardState.Commit = commit
+		// Don't set Vote for joining nodes
+		hardState.Vote = 0
 	}
 
-	// Always get current membership
+	// Get current membership
 	iter := s.session.Query(`
         SELECT node_id 
         FROM raft_membership 
@@ -205,19 +122,17 @@ func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	).Iter()
 
 	var nodeID uint64
-	var nodes []uint64
+	var voters []uint64
 	for iter.Scan(&nodeID) {
-		nodes = append(nodes, nodeID)
+		voters = append(voters, nodeID)
 	}
 	if err := iter.Close(); err != nil {
-		return raftpb.HardState{}, raftpb.ConfState{}, fmt.Errorf("get membership info: %w", err)
+		return raftpb.HardState{}, raftpb.ConfState{}, fmt.Errorf("get membership: %w", err)
 	}
 
-	// If no nodes found, use current node
-	if len(nodes) == 0 {
-		nodes = []uint64{s.nodeID}
+	confState := raftpb.ConfState{
+		Voters: voters,
 	}
-	confState.Voters = nodes
 
 	return hardState, confState, nil
 }
@@ -285,10 +200,15 @@ func (s *Storage) Term(i uint64) (uint64, error) {
 	// Log for debugging
 	log.Printf("Term requested for index %d (firstIndex=%d, lastIndex=%d)", i, s.firstIndex, s.lastIndex)
 
-	// Special case for initial state
-	if s.lastIndex == 0 || s.firstIndex == 0 {
-		if i == 1 {
-			return 0, nil // Return term 0 for the first entry in a fresh cluster
+	// Handle special cases for fresh cluster and initialization
+	if i == 0 {
+		return 0, nil
+	}
+
+	// For fresh cluster initialization
+	if s.lastIndex == 0 {
+		if i <= 1 {
+			return 0, nil // Return term 0 for initial entries
 		}
 		return 0, raft.ErrUnavailable
 	}
@@ -299,7 +219,6 @@ func (s *Storage) Term(i uint64) (uint64, error) {
 	if i > s.lastIndex {
 		return 0, raft.ErrUnavailable
 	}
-
 	// If it's a snapshot entry
 	if s.snapshot != nil && i == s.snapshot.Metadata.Index {
 		return s.snapshot.Metadata.Term, nil
@@ -368,38 +287,50 @@ func (s *Storage) CreateSnapshot(snapIndex uint64, cs *raftpb.ConfState, data []
 		return raftpb.Snapshot{}, raft.ErrSnapOutOfDate
 	}
 
+	// Get the term for the snapshot index
 	term, err := s.Term(snapIndex)
 	if err != nil {
 		return raftpb.Snapshot{}, fmt.Errorf("get term: %w", err)
 	}
 
-	// Marshal the ConfState
-	confStateData, err := json.Marshal(cs)
-	if err != nil {
-		return raftpb.Snapshot{}, fmt.Errorf("marshal confstate: %w", err)
-	}
-
-	// Save the snapshot
-	err = s.session.Query(`
-		INSERT INTO raft_snapshots (
-			namespace_id, snap_index, term, data, conf_state, created_at
-		) VALUES (?, ?, ?, ?, ?, ?)`,
-		s.namespaceID, snapIndex, term, data, confStateData, time.Now(),
-	).Exec()
-	if err != nil {
-		return raftpb.Snapshot{}, fmt.Errorf("save snapshot: %w", err)
-	}
-
-	// Update the cached snapshot
-	s.snapshot = &raftpb.Snapshot{
-		Data: data,
+	// Create snapshot metadata
+	snap := raftpb.Snapshot{
 		Metadata: raftpb.SnapshotMetadata{
 			Index:     snapIndex,
 			Term:      term,
 			ConfState: *cs,
 		},
+		Data: data,
 	}
 
+	// Marshal the snapshot as bytes
+	snapData, err := snap.Marshal()
+	if err != nil {
+		return raftpb.Snapshot{}, fmt.Errorf("marshal snapshot: %w", err)
+	}
+
+	// Save to Cassandra
+	err = s.session.Query(`
+        INSERT INTO raft_snapshots (
+            namespace_id,
+            snap_index,
+            term,
+            data,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+		s.namespaceID,
+		snapIndex,
+		term,
+		snapData,
+		time.Now(),
+	).Exec()
+
+	if err != nil {
+		return raftpb.Snapshot{}, fmt.Errorf("save snapshot: %w", err)
+	}
+
+	// Update in-memory state
+	s.snapshot = &snap
 	// Update first index
 	s.firstIndex = snapIndex + 1
 
@@ -501,62 +432,6 @@ func (s *Storage) CleanupSnapshots(retain int) error {
 	return s.session.ExecuteBatch(batch)
 }
 
-// LoadNewestAvailable loads the newest snapshot that matches one of the provided WAL snapshots
-func (s *Storage) LoadNewestAvailable(walSnaps []walpb.Snapshot) (raftpb.Snapshot, error) {
-	s.Lock()
-	defer s.Unlock()
-
-	if len(walSnaps) == 0 {
-		return s.Snapshot()
-	}
-
-	// Get all snapshots ordered by index descending
-	iter := s.session.Query(`
-		SELECT term, snap_index, data, conf_state
-		FROM raft_snapshots
-		WHERE namespace_id = ?
-		ORDER BY snap_index DESC`,
-		s.namespaceID,
-	).Iter()
-	defer func() {
-		err := iter.Close()
-		if err != nil {
-
-		}
-	}()
-
-	var term, index uint64
-	var data []byte
-	var confState raftpb.ConfState
-	var metadata []byte
-
-	// Iterate through snapshots from newest to oldest
-	for iter.Scan(&term, &index, &data, &confState, &metadata) {
-		// Check if this snapshot matches any WAL snapshot
-		for i := len(walSnaps) - 1; i >= 0; i-- {
-			if term == walSnaps[i].Term && index == walSnaps[i].Index {
-				// Found a match
-
-				return raftpb.Snapshot{
-					Data: data,
-					Metadata: raftpb.SnapshotMetadata{
-						Term:      term,
-						Index:     index,
-						ConfState: confState,
-					},
-				}, nil
-			}
-		}
-	}
-
-	if err := iter.Close(); err != nil {
-		return raftpb.Snapshot{}, fmt.Errorf("failed to load newest available snapshot: %v", err)
-	}
-
-	// No matching snapshot found
-	return raftpb.Snapshot{}, nil
-}
-
 // Append appends the new entries to storage
 func (s *Storage) Append(entries []raftpb.Entry) error {
 	if len(entries) == 0 {
@@ -611,4 +486,93 @@ func (s *Storage) Append(entries []raftpb.Entry) error {
 		first, last, s.firstIndex, s.lastIndex)
 
 	return nil
+}
+
+func (s *Storage) initIndices() error {
+	// Load the latest snapshot first
+	snapshot, err := s.loadLatestSnapshot()
+	if err != nil {
+		return fmt.Errorf("load snapshot: %w", err)
+	}
+	s.snapshot = snapshot
+
+	// Initialize indices
+	if snapshot != nil {
+		s.firstIndex = snapshot.Metadata.Index
+		s.lastIndex = snapshot.Metadata.Index
+	} else {
+		// For fresh cluster, start at index 1
+		s.firstIndex = 1
+		s.lastIndex = 0 // Will be updated if entries exist
+	}
+
+	// Get last index from entries
+	var maxIndex uint64
+	err = s.session.Query(`
+        SELECT MAX(snap_index) 
+        FROM raft_entries 
+        WHERE namespace_id = ?`,
+		s.namespaceID,
+	).Scan(&maxIndex)
+
+	if err != nil && err != gocql.ErrNotFound {
+		return fmt.Errorf("get entries: %w", err)
+	}
+
+	// Update lastIndex if we found entries
+	if err != gocql.ErrNotFound && maxIndex > 0 {
+		s.lastIndex = maxIndex
+		// For joining nodes, set firstIndex
+		if s.firstIndex == 1 {
+			// Get the minimum index available
+			var minIndex uint64
+			err = s.session.Query(`
+                SELECT MIN(snap_index) 
+                FROM raft_entries 
+                WHERE namespace_id = ?`,
+				s.namespaceID,
+			).Scan(&minIndex)
+			if err == nil && minIndex > 0 {
+				s.firstIndex = minIndex
+			}
+		}
+	}
+	log.Printf("Storage initialized with firstIndex=%d, lastIndex=%d", s.firstIndex, s.lastIndex)
+	return nil
+}
+
+func (s *Storage) loadLatestSnapshot() (*raftpb.Snapshot, error) {
+	var snapIndex, term uint64
+	var data, confStateData []byte
+	var createdAt time.Time
+
+	err := s.session.Query(`
+		SELECT snap_index, term, data, conf_state, created_at 
+		FROM raft_snapshots 
+		WHERE namespace_id = ?
+		ORDER BY snap_index DESC
+		LIMIT 1`,
+		s.namespaceID,
+	).Scan(&snapIndex, &term, &data, &confStateData, &createdAt)
+
+	if err == gocql.ErrNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get latest snapshot: %w", err)
+	}
+
+	var confState raftpb.ConfState
+	if err := json.Unmarshal(confStateData, &confState); err != nil {
+		return nil, fmt.Errorf("unmarshal constate: %w", err)
+	}
+
+	return &raftpb.Snapshot{
+		Data: data,
+		Metadata: raftpb.SnapshotMetadata{
+			Index:     snapIndex,
+			Term:      term,
+			ConfState: confState,
+		},
+	}, nil
 }

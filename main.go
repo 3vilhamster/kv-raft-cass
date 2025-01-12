@@ -30,6 +30,7 @@ func main() {
 	cluster := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
 	id := flag.Int("id", 1, "node ID")
 	kvport := flag.Int("port", 9121, "key-value server port")
+	raftPort := flag.Int("raftport", 9021, "raft server port")
 	join := flag.Bool("join", false, "join an existing cluster")
 	flag.Parse()
 
@@ -66,10 +67,10 @@ func main() {
 		panic(err)
 	}
 
-	commitC, errorC := newRaftNode(*id, logger, storage, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
+	commitC, errorC := newRaftNode(*id, *raftPort, logger, storage, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
 
-	kvs = newKVStore(storage, proposeC, commitC, errorC)
+	kvs = newKVStore(logger, storage, proposeC, commitC, errorC)
 
 	// the key-value http handler will propose updates to raft
-	serveHttpKVAPI(kvs, *kvport, confChangeC, errorC)
+	serveHttpKVAPI(logger, kvs, *kvport, confChangeC, errorC)
 }

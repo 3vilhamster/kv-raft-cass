@@ -15,50 +15,58 @@
 package main
 
 import (
-	"bytes"
-	"encoding/gob"
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.uber.org/zap"
 
 	"github.com/3vilhamster/kv-raft-cass/storage"
 )
 
 // a key-value store backed by raft
 type kvstore struct {
-	proposeC chan<- string // channel for proposing updates
-	mu       sync.RWMutex
-	kvStore  map[string]string // current committed key-value pairs
-	storage  storage.Raft
+	proposeC    chan<- string // channel for proposing updates
+	mu          sync.RWMutex
+	kvStore     map[string]string // current committed key-value pairs
+	storage     storage.Raft
+	logger      *zap.Logger
+	lastApplied uint64
+
+	// Add proposal tracking
+	proposals sync.Map // map[string]chan error
 }
 
 type kv struct {
-	Key string
-	Val string
+	Key string `json:"key"`
+	Val string `json:"val"`
 }
 
-func newKVStore(snapshotter storage.Raft, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
+func newKVStore(logger *zap.Logger, snapshotter storage.Raft, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
 	s := &kvstore{
 		proposeC: proposeC,
 		kvStore:  make(map[string]string),
 		storage:  snapshotter,
+		logger:   logger,
 	}
 
 	// Load snapshot if available
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
-		log.Printf("Error loading snapshot: %v", err)
+		logger.Info("loading snapshot", zap.Error(err))
 		return nil
 	}
 
 	if snapshot.Data != nil {
-		log.Printf("Loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
+		logger.Info("Loading snapshot", zap.Uint64("term", snapshot.Metadata.Term), zap.Uint64("index", snapshot.Metadata.Index))
 		if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
-			log.Printf("Error recovering from snapshot: %v", err)
+			logger.Error("recovering from snapshot", zap.Error(err))
 			return nil
 		}
+		s.lastApplied = snapshot.Metadata.Index
 	}
 
 	// Start processing commits
@@ -69,19 +77,68 @@ func newKVStore(snapshotter storage.Raft, proposeC chan<- string, commitC <-chan
 func (s *kvstore) Lookup(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	log.Printf("Looking up key: %s", key)
+
+	// Strip leading slash
+	if len(key) > 0 && key[0] == '/' {
+		key = key[1:]
+	}
+
+	s.logger.Debug("Looking up key", zap.String("key", key))
 	v, ok := s.kvStore[key]
-	log.Printf("Lookup result: key=%s found=%v value=%s", key, ok, v)
+	s.logger.Debug("Lookup result", zap.String("key", key), zap.Bool("found", ok), zap.String("value", v))
 	return v, ok
 }
 
-func (s *kvstore) Propose(k string, v string) {
-	log.Printf("Proposing key=%s value=%s", k, v)
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
-		log.Fatal(err)
+func (s *kvstore) Propose(k string, v string) error {
+	// Strip leading slash
+	if len(k) > 0 && k[0] == '/' {
+		k = k[1:]
 	}
-	s.proposeC <- buf.String()
+
+	s.logger.Debug("Proposing", zap.String("key", k), zap.String("value", v))
+
+	// Create proposal with unique ID
+	proposalID := s.nextProposalID()
+	waitC := make(chan error, 1)
+	s.proposals.Store(proposalID, waitC)
+	defer s.proposals.Delete(proposalID)
+
+	// Include proposal ID in the data
+	proposal := struct {
+		ID  string `json:"id"`
+		Key string `json:"key"`
+		Val string `json:"val"`
+	}{
+		ID:  proposalID,
+		Key: k,
+		Val: v,
+	}
+
+	data, err := json.Marshal(proposal)
+	if err != nil {
+		return fmt.Errorf("json marshal: %w", err)
+	}
+
+	// Send proposal
+	select {
+	case s.proposeC <- string(data):
+		s.logger.Debug("Proposal sent",
+			zap.String("key", k),
+			zap.String("id", proposalID))
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("proposal timed out")
+	}
+
+	// Wait for commit
+	select {
+	case err := <-waitC:
+		if err != nil {
+			return fmt.Errorf("commit failed: %w", err)
+		}
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("waiting for proposal commit timed out")
+	}
 }
 
 func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
@@ -90,10 +147,10 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			// signaled to load snapshot
 			snapshot, err := s.loadSnapshot()
 			if err != nil {
-				log.Panic(err)
+				s.logger.Panic(err.Error())
 			}
 			if snapshot.Data != nil {
-				log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
+				s.logger.Debug("loading snapshot", zap.Uint64("term", snapshot.Metadata.Term), zap.Uint64("index", snapshot.Metadata.Index))
 				if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
 					log.Panic(err)
 				}
@@ -102,19 +159,45 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 		}
 
 		for _, data := range commit.data {
-			var dataKv kv
-			dec := gob.NewDecoder(bytes.NewBufferString(data))
-			if err := dec.Decode(&dataKv); err != nil {
-				log.Fatalf("raftexample: could not decode message (%v)", err)
+			var proposal struct {
+				ID  string `json:"id"`
+				Key string `json:"key"`
+				Val string `json:"val"`
+			}
+
+			if err := json.Unmarshal([]byte(data), &proposal); err != nil {
+				s.logger.Fatal("failed to decode message",
+					zap.Error(err),
+					zap.String("data", data))
 			}
 			s.mu.Lock()
-			s.kvStore[dataKv.Key] = dataKv.Val
+			s.kvStore[proposal.Key] = proposal.Val
+			s.lastApplied++
 			s.mu.Unlock()
+
+			// Signal proposal completion
+			if proposal.ID != "" {
+				if waitC, ok := s.proposals.Load(proposal.ID); ok {
+					if c, ok := waitC.(chan error); ok {
+						c <- nil
+					}
+				}
+			}
+
+			s.logger.Debug("applied entry",
+				zap.String("key", proposal.Key),
+				zap.String("value", proposal.Val),
+				zap.String("id", proposal.ID),
+				zap.Uint64("index", s.lastApplied))
 		}
-		close(commit.applyDoneC)
+
+		if commit.applyDoneC != nil {
+			close(commit.applyDoneC)
+		}
 	}
+
 	if err, ok := <-errorC; ok {
-		log.Fatal(err)
+		s.logger.Fatal("error from raft", zap.Error(err))
 	}
 }
 
@@ -141,4 +224,9 @@ func (s *kvstore) recoverFromSnapshot(snapshot []byte) error {
 	defer s.mu.Unlock()
 	s.kvStore = store
 	return nil
+}
+
+// Add a helper to generate unique proposal IDs
+func (s *kvstore) nextProposalID() string {
+	return fmt.Sprintf("proposal-%d", time.Now().UnixNano())
 }

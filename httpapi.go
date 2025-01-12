@@ -15,54 +15,69 @@
 package main
 
 import (
-	"io/ioutil"
-	"log"
+	"io"
 	"net/http"
 	"strconv"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.uber.org/zap"
 )
 
 // Handler for a http based key-value store backed by raft
 type httpKVAPI struct {
 	store       *kvstore
 	confChangeC chan<- raftpb.ConfChange
+	logger      *zap.Logger
 }
 
 func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := r.RequestURI
-	defer r.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			h.logger.Error("close body", zap.Error(err))
+		}
+	}(r.Body)
 	switch {
 	case r.Method == "PUT":
-		v, err := ioutil.ReadAll(r.Body)
+		v, err := io.ReadAll(r.Body)
 		if err != nil {
-			log.Printf("Failed to read on PUT (%v)\n", err)
+			h.logger.Error("read on PUT", zap.Error(err))
 			http.Error(w, "Failed on PUT", http.StatusBadRequest)
 			return
 		}
 
-		h.store.Propose(key, string(v))
+		err = h.store.Propose(key[1:], string(v))
+		if err != nil {
+			h.logger.Error("failed to propose", zap.Error(err))
+			http.Error(w, "Failed on PUT", http.StatusInternalServerError)
+			return
+		}
 
 		// Optimistic-- no waiting for ack from raft. Value is not yet
 		// committed so a subsequent GET on the key may return old value
 		w.WriteHeader(http.StatusNoContent)
 	case r.Method == "GET":
-		if v, ok := h.store.Lookup(key); ok {
-			w.Write([]byte(v))
+		if v, ok := h.store.Lookup(key[1:]); ok {
+			_, err := w.Write([]byte(v))
+			if err != nil {
+				h.logger.Error("write on GET", zap.Error(err))
+				return
+			}
 		} else {
 			http.Error(w, "Failed to GET", http.StatusNotFound)
 		}
 	case r.Method == "POST":
-		url, err := ioutil.ReadAll(r.Body)
+		url, err := io.ReadAll(r.Body)
 		if err != nil {
-			log.Printf("Failed to read on POST (%v)\n", err)
+			h.logger.Error("read on POST", zap.Error(err))
 			http.Error(w, "Failed on POST", http.StatusBadRequest)
 			return
 		}
 
 		nodeId, err := strconv.ParseUint(key[1:], 0, 64)
 		if err != nil {
-			log.Printf("Failed to convert ID for conf change (%v)\n", err)
+			h.logger.Error("convert ID for conf change", zap.Error(err))
 			http.Error(w, "Failed on POST", http.StatusBadRequest)
 			return
 		}
@@ -79,7 +94,7 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "DELETE":
 		nodeId, err := strconv.ParseUint(key[1:], 0, 64)
 		if err != nil {
-			log.Printf("Failed to convert ID for conf change (%v)\n", err)
+			h.logger.Error("convert ID for conf change", zap.Error(err))
 			http.Error(w, "Failed on DELETE", http.StatusBadRequest)
 			return
 		}
@@ -102,22 +117,23 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveHttpKVAPI starts a key-value server with a GET/PUT API and listens.
-func serveHttpKVAPI(kv *kvstore, port int, confChangeC chan<- raftpb.ConfChange, errorC <-chan error) {
+func serveHttpKVAPI(logger *zap.Logger, kv *kvstore, port int, confChangeC chan<- raftpb.ConfChange, errorC <-chan error) {
 	srv := http.Server{
 		Addr: ":" + strconv.Itoa(port),
 		Handler: &httpKVAPI{
 			store:       kv,
 			confChangeC: confChangeC,
+			logger:      logger,
 		},
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil {
-			log.Fatal(err)
+			logger.Fatal("server stopped", zap.Error(err))
 		}
 	}()
 
 	// exit when raft goes down
 	if err, ok := <-errorC; ok {
-		log.Fatal(err)
+		logger.Fatal("got error from error channel", zap.Error(err))
 	}
 }

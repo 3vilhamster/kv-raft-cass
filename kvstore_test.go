@@ -17,11 +17,13 @@ package main
 import (
 	"reflect"
 	"testing"
+
+	"go.uber.org/zap/zaptest"
 )
 
 func Test_kvstore_snapshot(t *testing.T) {
 	tm := map[string]string{"foo": "bar"}
-	s := &kvstore{kvStore: tm}
+	s := &kvstore{kvStore: tm, logger: zaptest.NewLogger(t)}
 
 	v, _ := s.Lookup("foo")
 	if v != "bar" {
