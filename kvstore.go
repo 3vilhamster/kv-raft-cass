@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -38,11 +39,6 @@ type kvstore struct {
 
 	// Add proposal tracking
 	proposals sync.Map // map[string]chan error
-}
-
-type kv struct {
-	Key string `json:"key"`
-	Val string `json:"val"`
 }
 
 func newKVStore(logger *zap.Logger, snapshotter storage.Raft, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
@@ -90,20 +86,27 @@ func (s *kvstore) Lookup(key string) (string, bool) {
 }
 
 func (s *kvstore) Propose(k string, v string) error {
-	// Strip leading slash
 	if len(k) > 0 && k[0] == '/' {
 		k = k[1:]
 	}
 
-	s.logger.Debug("Proposing", zap.String("key", k), zap.String("value", v))
+	s.logger.Debug("Proposing",
+		zap.String("key", k),
+		zap.String("value", v))
 
-	// Create proposal with unique ID
 	proposalID := s.nextProposalID()
-	waitC := make(chan error, 1)
+	waitC := make(chan error, 1) // Buffered channel to prevent blocking
 	s.proposals.Store(proposalID, waitC)
-	defer s.proposals.Delete(proposalID)
 
-	// Include proposal ID in the data
+	// Ensure cleanup of proposal on exit
+	defer func() {
+		if _, ok := s.proposals.Load(proposalID); ok {
+			s.proposals.Delete(proposalID)
+			s.logger.Debug("cleaned up proposal",
+				zap.String("id", proposalID))
+		}
+	}()
+
 	proposal := struct {
 		ID  string `json:"id"`
 		Key string `json:"key"`
@@ -119,38 +122,52 @@ func (s *kvstore) Propose(k string, v string) error {
 		return fmt.Errorf("json marshal: %w", err)
 	}
 
-	// Send proposal
+	// Submit proposal with context timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
 	select {
 	case s.proposeC <- string(data):
 		s.logger.Debug("Proposal sent",
 			zap.String("key", k),
 			zap.String("id", proposalID))
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("proposal timed out")
+	case <-ctx.Done():
+		return fmt.Errorf("proposal send timed out")
 	}
 
-	// Wait for commit
+	// Wait for commit with context timeout
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	select {
 	case err := <-waitC:
 		if err != nil {
 			return fmt.Errorf("commit failed: %w", err)
 		}
+		s.logger.Debug("Proposal committed successfully",
+			zap.String("key", k),
+			zap.String("id", proposalID))
 		return nil
-	case <-time.After(5 * time.Second):
+	case <-ctx.Done():
 		return fmt.Errorf("waiting for proposal commit timed out")
 	}
 }
 
 func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 	for commit := range commitC {
+		s.logger.Debug("commit received")
+
 		if commit == nil {
+			s.logger.Debug("empty commit")
 			// signaled to load snapshot
 			snapshot, err := s.loadSnapshot()
 			if err != nil {
 				s.logger.Panic(err.Error())
 			}
 			if snapshot.Data != nil {
-				s.logger.Debug("loading snapshot", zap.Uint64("term", snapshot.Metadata.Term), zap.Uint64("index", snapshot.Metadata.Index))
+				s.logger.Debug("loading snapshot",
+					zap.Uint64("term", snapshot.Metadata.Term),
+					zap.Uint64("index", snapshot.Metadata.Index))
 				if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
 					log.Panic(err)
 				}
@@ -158,6 +175,11 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			continue
 		}
 
+		s.logger.Debug("commit with data",
+			zap.Int("data_count", len(commit.data)))
+
+		// Process all data in the commit before signaling completion
+		processed := make([]string, 0, len(commit.data))
 		for _, data := range commit.data {
 			var proposal struct {
 				ID  string `json:"id"`
@@ -166,38 +188,64 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			}
 
 			if err := json.Unmarshal([]byte(data), &proposal); err != nil {
-				s.logger.Fatal("failed to decode message",
+				s.logger.Error("failed to decode message",
 					zap.Error(err),
 					zap.String("data", data))
+				continue
 			}
+
+			// Apply changes to store
 			s.mu.Lock()
 			s.kvStore[proposal.Key] = proposal.Val
-			s.lastApplied++
 			s.mu.Unlock()
 
-			// Signal proposal completion
 			if proposal.ID != "" {
-				if waitC, ok := s.proposals.Load(proposal.ID); ok {
-					if c, ok := waitC.(chan error); ok {
-						c <- nil
-					}
-				}
+				processed = append(processed, proposal.ID)
 			}
-
-			s.logger.Debug("applied entry",
-				zap.String("key", proposal.Key),
-				zap.String("value", proposal.Val),
-				zap.String("id", proposal.ID),
-				zap.Uint64("index", s.lastApplied))
 		}
 
+		// Signal completions after processing all entries
+		for _, proposalID := range processed {
+			if waitC, ok := s.proposals.Load(proposalID); ok {
+				s.logger.Debug("signaling proposal completion",
+					zap.String("id", proposalID))
+
+				if c, ok := waitC.(chan error); ok {
+					// Ensure channel send doesn't block
+					select {
+					case c <- nil:
+						s.logger.Debug("proposal completion signaled",
+							zap.String("id", proposalID))
+					default:
+						s.logger.Warn("proposal completion channel blocked",
+							zap.String("id", proposalID))
+					}
+				}
+				s.proposals.Delete(proposalID)
+			}
+		}
+
+		// Signal apply completion after all processing is done
 		if commit.applyDoneC != nil {
 			close(commit.applyDoneC)
 		}
 	}
 
+	// Handle errors from raft
 	if err, ok := <-errorC; ok {
-		s.logger.Fatal("error from raft", zap.Error(err))
+		s.logger.Error("error from raft", zap.Error(err))
+		s.proposals.Range(func(key, value interface{}) bool {
+			if c, ok := value.(chan error); ok {
+				select {
+				case c <- err:
+				default:
+					s.logger.Warn("failed to signal error to proposal",
+						zap.String("id", key.(string)))
+				}
+			}
+			s.proposals.Delete(key)
+			return true
+		})
 	}
 }
 

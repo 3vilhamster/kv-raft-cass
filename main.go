@@ -67,7 +67,7 @@ func main() {
 		panic(err)
 	}
 
-	commitC, errorC := newRaftNode(*id, *raftPort, logger, storage, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
+	_, commitC, errorC := newRaftNode(*id, *raftPort, logger, storage, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
 
 	kvs = newKVStore(logger, storage, proposeC, commitC, errorC)
 

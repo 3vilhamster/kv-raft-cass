@@ -79,7 +79,7 @@ var defaultSnapshotCount uint64 = 10000
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
 func newRaftNode(id int, raftPort int, logger *zap.Logger, storage storage.Raft, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
-	confChangeC <-chan raftpb.ConfChange) (<-chan *commit, <-chan error) {
+	confChangeC <-chan raftpb.ConfChange) (*raftNode, <-chan *commit, <-chan error) {
 
 	commitC := make(chan *commit)
 	errorC := make(chan error)
@@ -105,7 +105,14 @@ func newRaftNode(id int, raftPort int, logger *zap.Logger, storage storage.Raft,
 		raftStorage: storage,
 	}
 	go rc.startRaft()
-	return commitC, errorC
+	return rc, commitC, errorC
+}
+
+func (rc *raftNode) isLeader() bool {
+	if rc.node == nil {
+		return false
+	}
+	return rc.node.Status().Lead == uint64(rc.id)
 }
 
 func (rc *raftNode) entriesToApply(ents []raftpb.Entry) (nents []raftpb.Entry) {
@@ -146,15 +153,15 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 	for i := range ents {
 		switch ents[i].Type {
 		case raftpb.EntryNormal:
+			rc.logger.Debug("Processing entry: type=EntryNormal",
+				zap.Uint64("index", ents[i].Index), zap.String("data", string(ents[i].Data)))
+
 			if len(ents[i].Data) == 0 {
+				rc.logger.Debug("Ignoring empty message")
 				// Ignore empty messages
 				rc.appliedIndex = ents[i].Index
 				continue
 			}
-
-			rc.logger.Debug("Processing normal entry",
-				zap.Uint64("index", ents[i].Index),
-				zap.String("data", string(ents[i].Data)))
 
 			// Only accept JSON data
 			if !json.Valid(ents[i].Data) {
@@ -163,10 +170,12 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 				continue
 			}
 
+			rc.logger.Debug("Append data to commit data", zap.String("data", string(ents[i].Data)))
 			data = append(data, string(ents[i].Data))
-			rc.logger.Debug("Processing entry: type=EntryNormal",
-				zap.Uint64("index", ents[i].Index), zap.String("data", string(ents[i].Data)))
 		case raftpb.EntryConfChange:
+			rc.logger.Debug("Processing entry: type=EntryConfChange",
+				zap.Uint64("index", ents[i].Index))
+
 			var cc raftpb.ConfChange
 			if err := cc.Unmarshal(ents[i].Data); err != nil {
 				rc.logger.Error("failed to unmarshal conf change",
@@ -176,15 +185,17 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 			}
 			rc.confState = *rc.node.ApplyConfChange(cc)
 			rc.appliedIndex = ents[i].Index
-			rc.logger.Debug("Processing entry: type=EntryConfChange",
-				zap.Uint64("index", ents[i].Index))
 		}
 	}
 
 	if len(data) > 0 {
 		applyDoneC = make(chan struct{})
+		rc.logger.Debug("Sending commit",
+			zap.Int("data_count", len(data)))
 		select {
 		case rc.commitC <- &commit{data: data, applyDoneC: applyDoneC}:
+			rc.logger.Debug("Commit sent successfully",
+				zap.Int("data_count", len(data)))
 			rc.appliedIndex = ents[len(ents)-1].Index
 		case <-rc.stopc:
 			return nil, false
@@ -216,9 +227,9 @@ func (rc *raftNode) startRaft() {
 		Storage:                   rc.raftStorage,
 		MaxSizePerMsg:             1024 * 1024,
 		MaxInflightMsgs:           256,
-		PreVote:                   false,
+		PreVote:                   true,
 		CheckQuorum:               true,
-		DisableProposalForwarding: true,
+		DisableProposalForwarding: false,
 	}
 
 	// Initialize transport before creating node
@@ -261,13 +272,19 @@ func (rc *raftNode) stop() {
 	rc.stopHTTP()
 	close(rc.commitC)
 	close(rc.errorC)
+	rc.logger.Debug("stopping node")
 	rc.node.Stop()
+	rc.logger.Debug("stopped")
 }
 
 func (rc *raftNode) stopHTTP() {
+	rc.logger.Debug("stopping http")
 	rc.transport.Stop()
+	rc.logger.Debug("transport stopped, closing httpstopc")
 	close(rc.httpstopc)
+	rc.logger.Debug("waiting for ack on httpdonec")
 	<-rc.httpdonec
+	rc.logger.Debug("httpdonec closed")
 }
 
 func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {

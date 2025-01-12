@@ -94,11 +94,10 @@ func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 
 	// Get the latest term and commit index
 	var term, commit uint64
-	err := s.session.Query(`
-        SELECT MAX(term) as term, MAX(snap_index) as commit
-        FROM raft_entries 
-        WHERE namespace_id = ?`,
-		s.namespaceID,
+	err := s.session.Query(`SELECT MAX(term) as term, MAX(snap_index) as commit
+    FROM raft_entries 
+    WHERE namespace_id = ? AND node_id = ?`,
+		s.namespaceID, s.nodeID,
 	).Scan(&term, &commit)
 
 	if err != nil && err != gocql.ErrNotFound {
@@ -138,10 +137,9 @@ func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 }
 
 func (s *Storage) SetHardState(st raftpb.HardState) error {
-	return s.session.Query(`
-		INSERT INTO raft_state (namespace_id, term, vote, commit, last_updated)
-		VALUES (?, ?, ?, ?, ?)`,
-		s.namespaceID, st.Term, st.Vote, st.Commit, time.Now(),
+	return s.session.Query(`INSERT INTO raft_state (namespace_id, node_id, term, vote, commit, last_updated)
+    VALUES (?, ?, ?, ?, ?, ?)`,
+		s.namespaceID, s.nodeID, st.Term, st.Vote, st.Commit, time.Now(),
 	).Exec()
 }
 
@@ -157,11 +155,10 @@ func (s *Storage) Entries(lo, hi, maxSize uint64) ([]raftpb.Entry, error) {
 		return nil, raft.ErrUnavailable
 	}
 
-	iter := s.session.Query(`
-		SELECT snap_index, term, entry_type, data 
-		FROM raft_entries 
-		WHERE namespace_id = ? AND snap_index >= ? AND snap_index < ?`,
-		s.namespaceID, lo, hi,
+	iter := s.session.Query(`SELECT snap_index, term, entry_type, data 
+    FROM raft_entries 
+    WHERE namespace_id = ? AND node_id = ? AND snap_index >= ? AND snap_index < ?`,
+		s.namespaceID, s.nodeID, lo, hi,
 	).Iter()
 
 	var entries []raftpb.Entry
@@ -230,11 +227,10 @@ func (s *Storage) Term(i uint64) (uint64, error) {
 	}
 
 	var term uint64
-	err := s.session.Query(`
-        SELECT term 
-        FROM raft_entries 
-        WHERE namespace_id = ? AND snap_index = ?`,
-		s.namespaceID, i,
+	err := s.session.Query(`SELECT term 
+    FROM raft_entries 
+    WHERE namespace_id = ? AND node_id = ? AND snap_index = ?`,
+		s.namespaceID, s.nodeID, i,
 	).Scan(&term)
 
 	if err == gocql.ErrNotFound {
@@ -310,15 +306,16 @@ func (s *Storage) CreateSnapshot(snapIndex uint64, cs *raftpb.ConfState, data []
 	}
 
 	// Save to Cassandra
-	err = s.session.Query(`
-        INSERT INTO raft_snapshots (
-            namespace_id,
-            snap_index,
-            term,
-            data,
-            created_at
-        ) VALUES (?, ?, ?, ?, ?)`,
+	err = s.session.Query(`INSERT INTO raft_snapshots (
+        namespace_id,
+        node_id,
+        snap_index,
+        term,
+        data,
+        created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)`,
 		s.namespaceID,
+		s.nodeID,
 		snapIndex,
 		term,
 		snapData,
@@ -335,10 +332,9 @@ func (s *Storage) CreateSnapshot(snapIndex uint64, cs *raftpb.ConfState, data []
 	s.firstIndex = snapIndex + 1
 
 	// Clean up old entries
-	err = s.session.Query(`
-		DELETE FROM raft_entries 
-		WHERE namespace_id = ? AND snap_index <= ?`,
-		s.namespaceID, snapIndex,
+	err = s.session.Query(`DELETE FROM raft_entries 
+    WHERE namespace_id = ? AND node_id = ? AND snap_index <= ?`,
+		s.namespaceID, s.nodeID, snapIndex,
 	).Exec()
 	if err != nil {
 		return raftpb.Snapshot{}, fmt.Errorf("cleanup entries: %w", err)
@@ -364,11 +360,10 @@ func (s *Storage) ApplySnapshot(snap raftpb.Snapshot) error {
 	}
 
 	// Save the snapshot
-	err = s.session.Query(`
-		INSERT INTO raft_snapshots (
-			namespace_id, snap_index, term, data, conf_state, created_at
-		) VALUES (?, ?, ?, ?, ?, ?)`,
-		s.namespaceID, snapIndex, snap.Metadata.Term, snap.Data, confStateData, time.Now(),
+	err = s.session.Query(`INSERT INTO raft_snapshots (
+        namespace_id, node_id, snap_index, term, data, conf_state, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		s.namespaceID, s.nodeID, snapIndex, snap.Metadata.Term, snap.Data, confStateData, time.Now(),
 	).Exec()
 	if err != nil {
 		return fmt.Errorf("save snapshot: %w", err)
@@ -386,10 +381,9 @@ func (s *Storage) DeleteSnapshot(index uint64) error {
 	s.Lock()
 	defer s.Unlock()
 
-	return s.session.Query(`
-		DELETE FROM raft_snapshots 
-		WHERE namespace_id = ? AND snap_index = ?`,
-		s.namespaceID, index,
+	return s.session.Query(`DELETE FROM raft_snapshots 
+    WHERE namespace_id = ? AND node_id = ? AND snap_index = ?`,
+		s.namespaceID, s.nodeID, index,
 	).Exec()
 }
 
@@ -399,12 +393,11 @@ func (s *Storage) CleanupSnapshots(retain int) error {
 	defer s.Unlock()
 
 	// Get all snapshot indices ordered by index descending
-	iter := s.session.Query(`
-		SELECT snap_index 
-		FROM raft_snapshots 
-		WHERE namespace_id = ? 
-		ORDER BY snap_index DESC`,
-		s.namespaceID,
+	iter := s.session.Query(`SELECT snap_index 
+    FROM raft_snapshots 
+    WHERE namespace_id = ? AND node_id = ?
+    ORDER BY snap_index DESC`,
+		s.namespaceID, s.nodeID,
 	).Iter()
 
 	var indices []uint64
@@ -423,10 +416,9 @@ func (s *Storage) CleanupSnapshots(retain int) error {
 	// Delete old snapshots
 	batch := s.session.NewBatch(gocql.UnloggedBatch)
 	for _, idx := range indices[retain:] {
-		batch.Query(`
-			DELETE FROM raft_snapshots 
-			WHERE namespace_id = ? AND snap_index = ?`,
-			s.namespaceID, idx)
+		batch.Query(`DELETE FROM raft_snapshots 
+    WHERE namespace_id = ? AND node_id = ? AND snap_index = ?`,
+			s.namespaceID, s.nodeID, idx)
 	}
 
 	return s.session.ExecuteBatch(batch)
@@ -464,11 +456,10 @@ func (s *Storage) Append(entries []raftpb.Entry) error {
 	now := time.Now()
 
 	for _, entry := range entries {
-		batch.Query(`
-            INSERT INTO raft_entries (
-                namespace_id, snap_index, term, entry_type, data, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)`,
-			s.namespaceID, entry.Index, entry.Term, int(entry.Type), entry.Data, now,
+		batch.Query(`INSERT INTO raft_entries (
+        namespace_id, node_id, snap_index, term, entry_type, data, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			s.namespaceID, s.nodeID, entry.Index, entry.Term, int(entry.Type), entry.Data, now,
 		)
 
 		// Update lastIndex as we add entries
@@ -508,11 +499,10 @@ func (s *Storage) initIndices() error {
 
 	// Get last index from entries
 	var maxIndex uint64
-	err = s.session.Query(`
-        SELECT MAX(snap_index) 
-        FROM raft_entries 
-        WHERE namespace_id = ?`,
-		s.namespaceID,
+	err = s.session.Query(`SELECT MAX(snap_index) 
+    FROM raft_entries 
+    WHERE namespace_id = ? AND node_id = ?`,
+		s.namespaceID, s.nodeID,
 	).Scan(&maxIndex)
 
 	if err != nil && err != gocql.ErrNotFound {
@@ -526,11 +516,10 @@ func (s *Storage) initIndices() error {
 		if s.firstIndex == 1 {
 			// Get the minimum index available
 			var minIndex uint64
-			err = s.session.Query(`
-                SELECT MIN(snap_index) 
-                FROM raft_entries 
-                WHERE namespace_id = ?`,
-				s.namespaceID,
+			err = s.session.Query(`SELECT MIN(snap_index) 
+    FROM raft_entries 
+    WHERE namespace_id = ? AND node_id = ?`,
+				s.namespaceID, s.nodeID,
 			).Scan(&minIndex)
 			if err == nil && minIndex > 0 {
 				s.firstIndex = minIndex
@@ -546,13 +535,12 @@ func (s *Storage) loadLatestSnapshot() (*raftpb.Snapshot, error) {
 	var data, confStateData []byte
 	var createdAt time.Time
 
-	err := s.session.Query(`
-		SELECT snap_index, term, data, conf_state, created_at 
-		FROM raft_snapshots 
-		WHERE namespace_id = ?
-		ORDER BY snap_index DESC
-		LIMIT 1`,
-		s.namespaceID,
+	err := s.session.Query(`SELECT snap_index, term, data, conf_state, created_at 
+    FROM raft_snapshots 
+    WHERE namespace_id = ? AND node_id = ?
+    ORDER BY snap_index DESC
+    LIMIT 1`,
+		s.namespaceID, s.nodeID,
 	).Scan(&snapIndex, &term, &data, &confStateData, &createdAt)
 
 	if err == gocql.ErrNotFound {

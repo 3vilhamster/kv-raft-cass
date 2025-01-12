@@ -26,87 +26,142 @@ import (
 
 	"github.com/gocql/gocql"
 	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
 	raftstorage "github.com/3vilhamster/kv-raft-cass/storage/raft"
 )
 
-func getSnapshotFn() (func() ([]byte, error), <-chan struct{}) {
-	snapshotTriggeredC := make(chan struct{})
-	return func() ([]byte, error) {
-		snapshotTriggeredC <- struct{}{}
-		return nil, nil
-	}, snapshotTriggeredC
-}
-
 type cluster struct {
-	peers              []string
-	commitC            []<-chan *commit
-	errorC             []<-chan error
-	proposeC           []chan string
-	confChangeC        []chan raftpb.ConfChange
-	snapshotTriggeredC []<-chan struct{}
-	address            string
+	peers       []string
+	commitC     []<-chan *commit
+	errorC      []<-chan error
+	proposeC    []chan string
+	confChangeC []chan raftpb.ConfChange
+	kvs         []*kvstore
+	nodes       []*raftNode
+	address     string
 }
 
 // newCluster creates a cluster of n nodes
-func newCluster(t *testing.T, n int) *cluster {
+func newCluster(t *testing.T, n int, withKvs bool) *cluster {
 	peers := make([]string, n)
 	for i := range peers {
 		peers[i] = fmt.Sprintf("http://127.0.0.1:%d", 20000+i)
 	}
 
 	clus := &cluster{
-		peers:              peers,
-		commitC:            make([]<-chan *commit, len(peers)),
-		errorC:             make([]<-chan error, len(peers)),
-		proposeC:           make([]chan string, len(peers)),
-		confChangeC:        make([]chan raftpb.ConfChange, len(peers)),
-		snapshotTriggeredC: make([]<-chan struct{}, len(peers)),
-		address:            peers[0],
+		peers:       peers,
+		commitC:     make([]<-chan *commit, len(peers)),
+		errorC:      make([]<-chan error, len(peers)),
+		proposeC:    make([]chan string, len(peers)),
+		confChangeC: make([]chan raftpb.ConfChange, len(peers)),
+		address:     peers[0],
 	}
 
 	sess := setupCassandra(t)
 
 	cleanupTestState(t, sess)
 
+	logger := zaptest.NewLogger(t)
+
 	for i := range clus.peers {
 		clus.proposeC[i] = make(chan string, 1)
 		clus.confChangeC[i] = make(chan raftpb.ConfChange, 1)
-		fn, snapshotTriggeredC := getSnapshotFn()
-		clus.snapshotTriggeredC[i] = snapshotTriggeredC
 
 		storage, err := raftstorage.New(sess, namespaceID, uint64(i+1))
 		if err != nil {
 			panic(err)
 		}
 
-		clus.commitC[i], clus.errorC[i] = newRaftNode(i+1, 20000+i, zaptest.NewLogger(t), storage, clus.peers, false, fn, clus.proposeC[i], clus.confChangeC[i])
+		var (
+			kvs  *kvstore
+			node *raftNode
+		)
+
+		getSnapshot := func() ([]byte, error) { return nil, nil }
+
+		nodeLogger := logger.With(zap.String("node", fmt.Sprintf("%d", i+1)))
+
+		node, clus.commitC[i], clus.errorC[i] = newRaftNode(i+1, 20000+i, nodeLogger, storage, clus.peers, false, getSnapshot, clus.proposeC[i], clus.confChangeC[i])
+
+		if withKvs {
+			kvs = newKVStore(nodeLogger, storage, clus.proposeC[i], clus.commitC[i], clus.errorC[i])
+			getSnapshot = func() ([]byte, error) { return kvs.getSnapshot() }
+		}
+
+		clus.nodes = append(clus.nodes, node)
+		clus.kvs = append(clus.kvs, kvs)
+	}
+
+	// Wait for cluster to stabilize and elect a leader
+	waitForLeader := func() bool {
+		deadline := time.Now().Add(5 * time.Second)
+		firstTry := true
+
+		for time.Now().Before(deadline) {
+			if firstTry {
+				// Let HTTP server start up on first try
+				time.Sleep(500 * time.Millisecond)
+				firstTry = false
+			}
+
+			leaderCount := 0
+			var leaderId int
+			for i, node := range clus.nodes {
+				if node.isLeader() {
+					leaderCount++
+					leaderId = i + 1
+				}
+			}
+
+			if leaderCount == 1 {
+				logger.Info("leader elected",
+					zap.Int("leader_id", leaderId),
+					zap.Duration("elapsed", time.Since(deadline.Add(-5*time.Second))))
+				return true
+			}
+
+			if leaderCount > 1 {
+				logger.Warn("multiple leaders detected",
+					zap.Int("count", leaderCount))
+			}
+
+			time.Sleep(100 * time.Millisecond)
+		}
+		return false
+	}
+
+	if !waitForLeader() {
+		t.Error("No leader elected within timeout")
+		clus.closeNoErrors(t)
+		t.FailNow()
 	}
 
 	return clus
 }
 
 // Close closes all cluster nodes and returns an error if any failed.
-func (clus *cluster) Close() (err error) {
-	for i := range clus.peers {
+func (cl *cluster) Close() (err error) {
+	for i := range cl.peers {
 		go func(i int) {
-			for range clus.commitC[i] {
+			for range cl.commitC[i] {
 				// drain pending commits
 			}
 		}(i)
-		close(clus.proposeC[i])
+		close(cl.proposeC[i])
+		close(cl.confChangeC[i])
 		// wait for channel to close
-		if erri := <-clus.errorC[i]; erri != nil {
+		if erri := <-cl.errorC[i]; erri != nil {
 			err = erri
 		}
 	}
 	return err
 }
 
-func (clus *cluster) closeNoErrors(t *testing.T) {
+func (cl *cluster) closeNoErrors(t *testing.T) {
 	t.Log("closing cluster...")
-	if err := clus.Close(); err != nil {
+	if err := cl.Close(); err != nil {
 		t.Fatal(err)
 	}
 	t.Log("closing cluster [done]")
@@ -115,7 +170,7 @@ func (clus *cluster) closeNoErrors(t *testing.T) {
 // TestProposeOnCommit starts three nodes and feeds commits back into the proposal
 // channel. The intent is to ensure blocking on a proposal won't block raft progress.
 func TestProposeOnCommit(t *testing.T) {
-	clus := newCluster(t, 3)
+	clus := newCluster(t, 3, false)
 	defer clus.closeNoErrors(t)
 
 	donec := make(chan struct{})
@@ -135,14 +190,10 @@ func TestProposeOnCommit(t *testing.T) {
 				}
 			}
 			donec <- struct{}{}
-			for range cC {
-				// acknowledge the commits from other nodes so
-				// raft continues to make progress
-			}
 		}(clus.proposeC[i], clus.commitC[i], clus.errorC[i])
 
 		// one message feedback per node
-		go func(i int) { clus.proposeC[i] <- `"foo"` }(i)
+		go func(i int) { clus.proposeC[i] <- sampleData("foo") }(i)
 	}
 
 	for range clus.peers {
@@ -152,7 +203,7 @@ func TestProposeOnCommit(t *testing.T) {
 
 // TestCloseProposerBeforeReplay tests closing the producer before raft starts.
 func TestCloseProposerBeforeReplay(t *testing.T) {
-	clus := newCluster(t, 1)
+	clus := newCluster(t, 1, false)
 	// close before replay so raft never starts
 	defer clus.closeNoErrors(t)
 }
@@ -164,7 +215,7 @@ func TestCloseProposerInflight(t *testing.T) {
 	sess := setupCassandra(t)
 	cleanupTestState(t, sess)
 
-	clus := newCluster(t, 1)
+	clus := newCluster(t, 1, false)
 	defer func() {
 		t.Log("closing cluster...")
 		if err := clus.Close(); err != nil {
@@ -188,23 +239,20 @@ func TestCloseProposerInflight(t *testing.T) {
 				t.Logf("Commit received: %q", data)
 				commitc <- data
 			}
-			if c.applyDoneC != nil {
-				close(c.applyDoneC)
-			}
 		}
 	}()
 
 	// Send proposals
 	go func() {
 		t.Log("Proposing foo")
-		clus.proposeC[0] <- `"foo"`
+		clus.proposeC[0] <- sampleData("foo")
 
 		t.Log("Proposing bar")
-		clus.proposeC[0] <- `"bar"`
+		clus.proposeC[0] <- sampleData("bar")
 	}()
 
 	// Expected sequence of messages
-	expected := []string{`"foo"`, `"bar"`}
+	expected := []string{sampleData("foo"), sampleData("bar")}
 	received := make([]string, 0, len(expected))
 
 	// Wait for commits with timeout
@@ -236,41 +284,15 @@ func TestCloseProposerInflight(t *testing.T) {
 }
 
 func TestPutAndGetKeyValue(t *testing.T) {
-	clusters := []string{"http://127.0.0.1:9021"}
-
-	proposeC := make(chan string)
-	defer close(proposeC)
-
-	confChangeC := make(chan raftpb.ConfChange)
-	defer close(confChangeC)
-
-	sess := setupCassandra(t)
-
-	// Clean up state before test
-	cleanupTestState(t, sess)
-
-	storage, err := raftstorage.New(sess, namespaceID, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var kvs *kvstore
-	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC := newRaftNode(1, 9021, zaptest.NewLogger(t), storage, clusters, false, getSnapshot, proposeC, confChangeC)
-
-	kvs = newKVStore(zaptest.NewLogger(t), storage, proposeC, commitC, errorC)
-	if kvs == nil {
-		t.Fatal("Failed to create kvstore")
-	}
+	cl := newCluster(t, 3, true)
+	defer cl.closeNoErrors(t)
 
 	srv := httptest.NewServer(&httpKVAPI{
-		store:       kvs,
-		confChangeC: confChangeC,
+		store:       cl.kvs[0],
+		confChangeC: cl.confChangeC[0],
 		logger:      zaptest.NewLogger(t),
 	})
 	defer srv.Close()
-
-	time.Sleep(time.Second)
 
 	// Test PUT
 	wantKey, wantValue := "test-key", "test-value"
@@ -297,6 +319,7 @@ func TestPutAndGetKeyValue(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNoContent {
 		t.Errorf("PUT response code = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		t.FailNow()
 	}
 
 	// Test GET
@@ -324,7 +347,7 @@ func TestPutAndGetKeyValue(t *testing.T) {
 // TestAddNewNode tests adding new node to the existing cluster.
 func TestAddNewNode(t *testing.T) {
 	// Start with a cluster
-	clus := newCluster(t, 1)
+	clus := newCluster(t, 1, true)
 	defer clus.closeNoErrors(t)
 
 	time.Sleep(time.Second)
@@ -352,7 +375,7 @@ func TestAddNewNode(t *testing.T) {
 
 	// Start the new node in join mode
 	peers := []string{clus.peers[0], newNodeURL}
-	commitC2, errorC2 := newRaftNode(int(newNodeID), 20000+int(newNodeID), zaptest.NewLogger(t), storage2, peers, true, func() ([]byte, error) { return kvs.getSnapshot() }, proposeC2, confChangeC2)
+	_, commitC2, errorC2 := newRaftNode(int(newNodeID), 20000+int(newNodeID), zaptest.NewLogger(t), storage2, peers, true, func() ([]byte, error) { return kvs.getSnapshot() }, proposeC2, confChangeC2)
 
 	// Send a test message
 	testMsg := struct {
@@ -388,7 +411,7 @@ func TestSnapshot(t *testing.T) {
 	}()
 
 	// Create cluster
-	clus := newCluster(t, 1)
+	clus := newCluster(t, 1, false)
 	defer func() {
 		t.Log("closing cluster...")
 		clus.closeNoErrors(t)
@@ -398,7 +421,7 @@ func TestSnapshot(t *testing.T) {
 	snapshotTriggered := make(chan struct{})
 	go func() {
 		// Send message to trigger snapshot
-		clus.proposeC[0] <- `"foo"`
+		clus.proposeC[0] <- sampleData("foo")
 
 		// Wait for response
 		for c := range clus.commitC[0] {
@@ -459,4 +482,8 @@ func setupCassandra(t *testing.T) *gocql.Session {
 		t.Fatal(err)
 	}
 	return sess
+}
+
+func sampleData(key string) string {
+	return fmt.Sprintf(`{"key": "%s", "val": "sample-value"}`, key)
 }
