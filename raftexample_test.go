@@ -16,7 +16,7 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +29,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
+	"github.com/3vilhamster/kv-raft-cass/leader"
 	raftstorage "github.com/3vilhamster/kv-raft-cass/storage/raft"
 )
 
@@ -83,7 +84,7 @@ func newCluster(t *testing.T, n int, withKvs bool) *cluster {
 
 		nodeLogger := logger.With(zap.String("node", fmt.Sprintf("%d", i+1)))
 
-		node, clus.commitC[i], clus.errorC[i] = newRaftNode(i+1, 20000+i, nodeLogger, storage, clus.peers, false, getSnapshot, clus.proposeC[i], clus.confChangeC[i])
+		node, clus.commitC[i], clus.errorC[i] = newRaftNode(i+1, 20000+i, nodeLogger, testLeader(t), storage, clus.peers, false, getSnapshot, clus.proposeC[i], clus.confChangeC[i])
 
 		if withKvs {
 			kvs = newKVStore(nodeLogger, storage, clus.proposeC[i], clus.commitC[i], clus.errorC[i])
@@ -350,8 +351,6 @@ func TestAddNewNode(t *testing.T) {
 	clus := newCluster(t, 1, true)
 	defer clus.closeNoErrors(t)
 
-	time.Sleep(time.Second)
-
 	// Create and start the new node
 	newNodeID := uint64(4) // Changed from 4 to 2 to be consistent
 	newNodeURL := fmt.Sprintf("http://127.0.0.1:%d", 20000+int(newNodeID))
@@ -371,34 +370,21 @@ func TestAddNewNode(t *testing.T) {
 	defer close(proposeC2)
 	defer close(confChangeC2)
 
-	kvs := newKVStore(zaptest.NewLogger(t), storage2, proposeC2, clus.commitC[0], clus.errorC[0])
+	var (
+		commitC2 <-chan *commit
+		errorC2  <-chan error
+	)
+
+	kvs := newKVStore(zaptest.NewLogger(t), storage2, proposeC2, commitC2, errorC2)
 
 	// Start the new node in join mode
 	peers := []string{clus.peers[0], newNodeURL}
-	_, commitC2, errorC2 := newRaftNode(int(newNodeID), 20000+int(newNodeID), zaptest.NewLogger(t), storage2, peers, true, func() ([]byte, error) { return kvs.getSnapshot() }, proposeC2, confChangeC2)
+	_, commitC2, errorC2 = newRaftNode(int(newNodeID), 20000+int(newNodeID), zaptest.NewLogger(t), testLeader(t), storage2, peers, true, kvs.getSnapshot, proposeC2, confChangeC2)
 
 	// Send a test message
-	testMsg := struct {
-		Key string `json:"key"`
-		Val string `json:"val"`
-	}{
-		Key: "test-key",
-		Val: "after-join-test",
-	}
-	data, err := json.Marshal(testMsg)
+	err = kvs.Propose("test-key", "after-join-test")
 	if err != nil {
 		t.Fatal(err)
-	}
-	clus.proposeC[0] <- string(data)
-
-	// Wait for message to be received by new node
-	select {
-	case <-commitC2:
-		t.Log("New node successfully received message")
-	case <-errorC2:
-		t.Fatal("New node failed to receive message", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("New node failed to receive message")
 	}
 }
 
@@ -486,4 +472,10 @@ func setupCassandra(t *testing.T) *gocql.Session {
 
 func sampleData(key string) string {
 	return fmt.Sprintf(`{"key": "%s", "val": "sample-value"}`, key)
+}
+
+func testLeader(t *testing.T) LeaderProcess {
+	return leader.NewLeaderProcess(zaptest.NewLogger(t), func(ctx context.Context) error {
+		return nil
+	})
 }

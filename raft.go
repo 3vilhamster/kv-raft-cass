@@ -39,6 +39,11 @@ type commit struct {
 	applyDoneC chan<- struct{}
 }
 
+// LeaderProcess is an interface for handling leadership changes.
+type LeaderProcess interface {
+	OnLeadershipChanged(isLeader bool)
+}
+
 // A key-value stream backed by raft
 type raftNode struct {
 	raftPort int
@@ -69,6 +74,8 @@ type raftNode struct {
 	httpdonec chan struct{} // signals http server shutdown complete
 
 	logger *zap.Logger
+
+	leaderProcess LeaderProcess
 }
 
 var defaultSnapshotCount uint64 = 10000
@@ -78,7 +85,7 @@ var defaultSnapshotCount uint64 = 10000
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, raftPort int, logger *zap.Logger, storage storage.Raft, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
+func newRaftNode(id int, raftPort int, logger *zap.Logger, leaderProcess LeaderProcess, storage storage.Raft, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
 	confChangeC <-chan raftpb.ConfChange) (*raftNode, <-chan *commit, <-chan error) {
 
 	commitC := make(chan *commit)
@@ -358,7 +365,6 @@ func (rc *raftNode) serveChannels() {
 	// send proposals over raft
 	go func() {
 		confChangeCount := uint64(0)
-
 		for rc.proposeC != nil && rc.confChangeC != nil {
 			select {
 			case prop, ok := <-rc.proposeC:
@@ -422,14 +428,33 @@ func (rc *raftNode) serveChannels() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
+	var lastLeaderStatus bool
+
 	// event loop on raft state machine updates
 	for {
 		select {
 		case <-ticker.C:
 			rc.node.Tick()
 
+			// Check leadership status
+			isLeader := rc.isLeader()
+			if isLeader != lastLeaderStatus {
+				lastLeaderStatus = isLeader
+				if rc.leaderProcess != nil {
+					rc.leaderProcess.OnLeadershipChanged(isLeader)
+				}
+			}
+
 		// store raft entries to wal, then publish over commit channel
 		case rd := <-rc.node.Ready():
+			isLeader := rc.isLeader()
+			if isLeader != lastLeaderStatus {
+				lastLeaderStatus = isLeader
+				if rc.leaderProcess != nil {
+					rc.leaderProcess.OnLeadershipChanged(isLeader)
+				}
+			}
+
 			// Save entries and HardState before sending messages
 			if err := rc.raftStorage.Append(rd.Entries); err != nil {
 				rc.logger.Fatal("failed to append entries", zap.Error(err))

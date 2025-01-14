@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.uber.org/zap"
 
+	"github.com/3vilhamster/kv-raft-cass/leader"
 	raftstorage "github.com/3vilhamster/kv-raft-cass/storage/raft"
 )
 
@@ -67,7 +69,13 @@ func main() {
 		panic(err)
 	}
 
-	_, commitC, errorC := newRaftNode(*id, *raftPort, logger, storage, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
+	leaderProcess := leader.NewLeaderProcess(
+		logger,
+		func(ctx context.Context) error {
+			return nil
+		})
+
+	_, commitC, errorC := newRaftNode(*id, *raftPort, logger, leaderProcess, storage, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
 
 	kvs = newKVStore(logger, storage, proposeC, commitC, errorC)
 
