@@ -85,6 +85,7 @@ func (m *MockDiscovery) GetJoinEndpoints() ([]string, error) {
 			httpPort = 9121 // Default HTTP port if not specified
 		}
 
+		// Fix: Use proper URL format with host:port
 		endpoints = append(endpoints, fmt.Sprintf("http://%s:%d/join", addr, httpPort))
 	}
 

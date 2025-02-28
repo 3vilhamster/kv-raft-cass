@@ -154,13 +154,19 @@ func (rc *raftNode) getLeaderURL() (string, error) {
 		return "", errors.New("no leader elected yet")
 	}
 
-	// Try to get leader URL from our transport peers
-	peers := rc.transport.ActivePeers()
-	for _, peer := range peers {
-		if uint64(peer) == leaderID {
-			urls := rc.transport.Get(peer)
-			if len(urls) > 0 {
-				return urls[0], nil
+	// We need to find peer URLs manually since we don't have direct access
+	// to the URLs through the transport API
+	leaderTypeID := types.ID(leaderID)
+
+	// Check if this peer is active
+	activeSince := rc.transport.ActiveSince(leaderTypeID)
+	if !activeSince.IsZero() {
+		// This peer is active, but we need to get its URL
+		// In the initialize transport code, URLs should have been mapped to this ID
+		// We need to check our peers list
+		for i, peer := range rc.peers {
+			if i+1 == int(leaderID) {
+				return peer, nil
 			}
 		}
 	}
@@ -169,8 +175,9 @@ func (rc *raftNode) getLeaderURL() (string, error) {
 	if rc.discovery != nil {
 		nodes, err := rc.discovery.GetClusterNodes()
 		if err == nil && len(nodes) > 0 {
-			// We don't know which node is the leader, so we can't help
-			return "", errors.New("leader URL not found in transport")
+			// If we're using discovery and can't find the leader in our transport,
+			// return an error so the client can retry or try a different node
+			return "", errors.New("leader not found in transport, try another node")
 		}
 	}
 
@@ -656,9 +663,24 @@ func (rc *raftNode) initTransport() {
 		rc.logger.Fatal("rafthttp.Transport.Start", zap.Error(err))
 	}
 
-	// For joining node, only add the leader initially
+	// For joining node, use discovery if available
 	if rc.join {
-		rc.transport.AddPeer(types.ID(1), []string{rc.peers[0]})
+		// If we're joining and have discovery, we don't need to add any peers yet
+		// Discovery will handle finding peers during the join process
+		if rc.discovery != nil {
+			rc.logger.Info("joining via discovery, waiting for cluster nodes")
+			return
+		}
+
+		// For backward compatibility with old tests that don't use discovery
+		// Only attempt to add peer from rc.peers if the slice is not empty
+		if len(rc.peers) > 0 {
+			rc.logger.Info("joining using static peer list",
+				zap.String("leader_url", rc.peers[0]))
+			rc.transport.AddPeer(types.ID(1), []string{rc.peers[0]})
+		} else {
+			rc.logger.Warn("joining but no peers or discovery available")
+		}
 		return
 	}
 

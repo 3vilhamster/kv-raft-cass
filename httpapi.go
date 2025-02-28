@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.uber.org/zap"
@@ -134,8 +135,19 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *httpKVAPI) handleJoin(w http.ResponseWriter, r *http.Request) {
 	var req discovery.NodeJoinRequest
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.logger.Error("failed to decode join request", zap.Error(err))
+	// Ensure we can read the body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.logger.Error("failed to read join request body", zap.Error(err))
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	// Parse the JSON
+	if err := json.Unmarshal(body, &req); err != nil {
+		h.logger.Error("failed to decode join request",
+			zap.Error(err),
+			zap.String("body", string(body)))
 		http.Error(w, "Failed to decode request", http.StatusBadRequest)
 		return
 	}
@@ -145,9 +157,9 @@ func (h *httpKVAPI) handleJoin(w http.ResponseWriter, r *http.Request) {
 		zap.String("url", req.NodeURL))
 
 	// Forward to leader if we're not the leader
-	if !h.raftNode.isLeader() {
+	if h.raftNode != nil && !h.raftNode.isLeader() {
 		h.logger.Info("forwarding join request to leader")
-		leaderURL, err := h.getLeaderURL()
+		leaderURL, err := h.raftNode.getLeaderURL()
 		if err != nil {
 			h.logger.Error("failed to get leader URL", zap.Error(err))
 			http.Error(w, "Cannot determine leader", http.StatusServiceUnavailable)
@@ -167,7 +179,8 @@ func (h *httpKVAPI) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 		// Return the leader's response
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		responseBody, _ := io.ReadAll(resp.Body)
+		w.Write(responseBody)
 		return
 	}
 
@@ -179,13 +192,28 @@ func (h *httpKVAPI) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send to confChange channel
-	h.confChangeC <- cc
+	select {
+	case h.confChangeC <- cc:
+		// Successfully sent the conf change
+		h.logger.Info("sent conf change to add node",
+			zap.Uint64("node_id", req.NodeID))
+	case <-time.After(3 * time.Second):
+		// Timeout sending to the channel
+		h.logger.Error("timed out sending conf change",
+			zap.Uint64("node_id", req.NodeID))
+		http.Error(w, "Timed out processing join request", http.StatusServiceUnavailable)
+		return
+	}
 
 	// Create response with leader information
 	response := discovery.NodeJoinResponse{
 		Success: true,
 		Message: "Join request accepted",
-		Leader:  h.raftNode.getLocalURL(),
+	}
+
+	// Include leader URL if available
+	if h.raftNode != nil {
+		response.Leader = h.raftNode.getLocalURL()
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -16,7 +16,7 @@ package main
 import (
 	"context"
 	"flag"
-	"strings"
+	"fmt"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -73,7 +73,7 @@ func main() {
 	}
 
 	// Define node address
-	nodeAddress := strings.Join([]string{*localAddress, string(*raftPort)}, ":")
+	nodeAddress := fmt.Sprintf("%s:%d", *localAddress, *raftPort)
 
 	// Setup discovery service
 	var discoveryService discovery.Discovery
