@@ -17,6 +17,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -29,6 +31,7 @@ import (
 	stats "go.etcd.io/etcd/server/v3/etcdserver/api/v2stats"
 	"go.uber.org/zap"
 
+	"github.com/3vilhamster/kv-raft-cass/discovery"
 	"github.com/3vilhamster/kv-raft-cass/storage"
 )
 
@@ -76,43 +79,102 @@ type raftNode struct {
 	logger *zap.Logger
 
 	leaderProcess LeaderProcess
+
+	// Add these new fields
+	address          string              // Local node address (hostname:port)
+	discovery        discovery.Discovery // Discovery service
+	bootstrapAllowed bool                // Whether this node can bootstrap if no other n
 }
 
 var defaultSnapshotCount uint64 = 10000
+
+type raftNodeParams struct {
+	ID               int
+	RaftPort         int
+	Address          string
+	Logger           *zap.Logger
+	LeaderProcess    LeaderProcess
+	Storage          storage.Raft
+	Discovery        discovery.Discovery
+	Join             bool
+	BootstrapAllowed bool
+	GetSnapshot      func() ([]byte, error)
+	ProposeC         <-chan string
+	ConfChangeC      <-chan raftpb.ConfChange
+}
 
 // newRaftNode initiates a raft instance and returns a committed log entry
 // channel and error channel. Proposals for log updates are sent over the
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, raftPort int, logger *zap.Logger, leaderProcess LeaderProcess, storage storage.Raft, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
-	confChangeC <-chan raftpb.ConfChange) (*raftNode, <-chan *commit, <-chan error) {
-
+func newRaftNode(p raftNodeParams) (*raftNode, <-chan *commit, <-chan error) {
 	commitC := make(chan *commit)
 	errorC := make(chan error)
 
 	rc := &raftNode{
-		raftPort: raftPort,
+		raftPort: p.RaftPort,
+		address:  p.Address,
 
-		proposeC:    proposeC,
-		confChangeC: confChangeC,
+		proposeC:    p.ProposeC,
+		confChangeC: p.ConfChangeC,
 		commitC:     commitC,
 		errorC:      errorC,
-		id:          id,
-		peers:       peers,
-		join:        join,
-		getSnapshot: getSnapshot,
+		id:          p.ID,
+		join:        p.Join,
+		getSnapshot: p.GetSnapshot,
 		snapCount:   defaultSnapshotCount,
 		stopc:       make(chan struct{}),
 		httpstopc:   make(chan struct{}),
 		httpdonec:   make(chan struct{}),
 
-		logger: logger,
-
-		raftStorage: storage,
+		logger:           p.Logger,
+		discovery:        p.Discovery,
+		bootstrapAllowed: p.BootstrapAllowed,
+		raftStorage:      p.Storage,
+		leaderProcess:    p.LeaderProcess,
 	}
 	go rc.startRaft()
 	return rc, commitC, errorC
+}
+
+func (rc *raftNode) getLocalURL() string {
+	return fmt.Sprintf("http://%s", rc.address)
+}
+
+func (rc *raftNode) getLeaderURL() (string, error) {
+	// Check if we're the leader
+	if rc.isLeader() {
+		return rc.getLocalURL(), nil
+	}
+
+	// Get leader ID from Raft state
+	leaderID := rc.node.Status().Lead
+	if leaderID == 0 {
+		return "", errors.New("no leader elected yet")
+	}
+
+	// Try to get leader URL from our transport peers
+	peers := rc.transport.ActivePeers()
+	for _, peer := range peers {
+		if uint64(peer) == leaderID {
+			urls := rc.transport.Get(peer)
+			if len(urls) > 0 {
+				return urls[0], nil
+			}
+		}
+	}
+
+	// If not found in transport, try discovery
+	if rc.discovery != nil {
+		nodes, err := rc.discovery.GetClusterNodes()
+		if err == nil && len(nodes) > 0 {
+			// We don't know which node is the leader, so we can't help
+			return "", errors.New("leader URL not found in transport")
+		}
+	}
+
+	return "", errors.New("leader URL not found")
 }
 
 func (rc *raftNode) isLeader() bool {
@@ -120,6 +182,15 @@ func (rc *raftNode) isLeader() bool {
 		return false
 	}
 	return rc.node.Status().Lead == uint64(rc.id)
+}
+
+func (rc *raftNode) joinCluster() error {
+	if rc.discovery == nil {
+		return errors.New("no discovery service configured")
+	}
+
+	// Use the discovery service to join the cluster
+	return rc.discovery.JoinCluster(uint64(rc.id), rc.address, 500*time.Millisecond, 10)
 }
 
 func (rc *raftNode) entriesToApply(ents []raftpb.Entry) (nents []raftpb.Entry) {
@@ -190,7 +261,26 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 					zap.Binary("data", ents[i].Data))
 				continue
 			}
+
+			// Apply the conf change
 			rc.confState = *rc.node.ApplyConfChange(cc)
+
+			// When a node is added, update the transport layer
+			if cc.Type == raftpb.ConfChangeAddNode && cc.NodeID != uint64(rc.id) {
+				nodeURL := string(cc.Context)
+				if nodeURL != "" {
+					rc.logger.Info("adding peer to transport",
+						zap.Uint64("node_id", cc.NodeID),
+						zap.String("url", nodeURL))
+					rc.transport.AddPeer(types.ID(cc.NodeID), []string{nodeURL})
+				}
+			} else if cc.Type == raftpb.ConfChangeRemoveNode && cc.NodeID != uint64(rc.id) {
+				// Remove the peer from transport
+				rc.logger.Info("removing peer from transport",
+					zap.Uint64("node_id", cc.NodeID))
+				rc.transport.RemovePeer(types.ID(cc.NodeID))
+			}
+
 			rc.appliedIndex = ents[i].Index
 		}
 	}
@@ -248,25 +338,52 @@ func (rc *raftNode) startRaft() {
 		// For joining nodes, we start with empty state and let Raft catch up
 		rc.node = raft.RestartNode(c)
 
-		// Add self to the transport but don't initialize as voter
-		rc.transport.AddPeer(types.ID(1), []string{rc.peers[0]})
+		// Try to join the cluster using discovery
+		if err := rc.joinCluster(); err != nil {
+			rc.logger.Error("failed to join cluster", zap.Error(err))
+			// We'll continue anyway and retry later
+		}
 	} else {
-		peers := make([]raft.Peer, 0, len(rc.peers))
-		for i := range rc.peers {
-			peers = append(peers, raft.Peer{ID: uint64(i + 1)})
+		// Check if we should bootstrap or join
+		shouldBootstrap := true
+
+		if rc.discovery != nil {
+			// Try to find existing nodes
+			nodes, err := rc.discovery.GetClusterNodes()
+			if err == nil && len(nodes) > 0 {
+				// Other nodes exist, we should join instead
+				rc.logger.Info("existing nodes found, switching to join mode",
+					zap.Int("found_nodes", len(nodes)),
+					zap.Strings("nodes", nodes))
+				shouldBootstrap = false
+				rc.join = true
+
+				// Restart in joining mode
+				rc.node = raft.RestartNode(c)
+
+				// Try to join
+				if err := rc.joinCluster(); err != nil {
+					rc.logger.Error("failed to join existing cluster", zap.Error(err))
+					// We'll continue anyway
+				}
+			}
 		}
 
-		// For single-node cluster, ensure it becomes leader immediately
-		if len(peers) == 1 {
-			c.ElectionTick = 2 // Speed up election for single node
-			c.HeartbeatTick = 1
+		if shouldBootstrap {
+			if !rc.bootstrapAllowed {
+				rc.logger.Fatal("attempted to bootstrap but not allowed")
+			}
+
+			// Bootstrap as single-node cluster
+			peers := make([]raft.Peer, 1)
+			peers[0] = raft.Peer{ID: uint64(rc.id)}
+
+			rc.logger.Info("bootstrapping new cluster",
+				zap.Int("id", rc.id),
+				zap.Int("peer_count", len(peers)))
+
+			rc.node = raft.StartNode(c, peers)
 		}
-
-		rc.logger.Info("starting node",
-			zap.Int("id", rc.id),
-			zap.Int("peer_count", len(peers)))
-
-		rc.node = raft.StartNode(c, peers)
 	}
 
 	// Start the transport services

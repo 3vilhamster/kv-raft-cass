@@ -15,18 +15,25 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.uber.org/zap"
+
+	"github.com/3vilhamster/kv-raft-cass/discovery"
 )
 
 // Handler for a http based key-value store backed by raft
 type httpKVAPI struct {
 	store       *kvstore
 	confChangeC chan<- raftpb.ConfChange
+	raftNode    *raftNode // Added to access raftNode methods
 	logger      *zap.Logger
 }
 
@@ -38,6 +45,13 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.logger.Error("close body", zap.Error(err))
 		}
 	}(r.Body)
+
+	// Special handling for join endpoint
+	if r.Method == "POST" && strings.HasSuffix(key, "/join") {
+		h.handleJoin(w, r)
+		return
+	}
+
 	switch {
 	case r.Method == "PUT":
 		v, err := io.ReadAll(r.Body)
@@ -116,13 +130,82 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleJoin processes requests to join the Raft cluster
+func (h *httpKVAPI) handleJoin(w http.ResponseWriter, r *http.Request) {
+	var req discovery.NodeJoinRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logger.Error("failed to decode join request", zap.Error(err))
+		http.Error(w, "Failed to decode request", http.StatusBadRequest)
+		return
+	}
+
+	h.logger.Info("received join request",
+		zap.Uint64("node_id", req.NodeID),
+		zap.String("url", req.NodeURL))
+
+	// Forward to leader if we're not the leader
+	if !h.raftNode.isLeader() {
+		h.logger.Info("forwarding join request to leader")
+		leaderURL, err := h.getLeaderURL()
+		if err != nil {
+			h.logger.Error("failed to get leader URL", zap.Error(err))
+			http.Error(w, "Cannot determine leader", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Forward the request
+		forwardURL := fmt.Sprintf("%s/join", leaderURL)
+		jsonData, _ := json.Marshal(req)
+		resp, err := http.Post(forwardURL, "application/json", bytes.NewBuffer(jsonData))
+		if err != nil {
+			h.logger.Error("failed to forward join request", zap.Error(err))
+			http.Error(w, "Failed to forward request", http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		// Return the leader's response
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	// We're the leader, so process the join request
+	cc := raftpb.ConfChange{
+		Type:    raftpb.ConfChangeAddNode,
+		NodeID:  req.NodeID,
+		Context: []byte(req.NodeURL),
+	}
+
+	// Send to confChange channel
+	h.confChangeC <- cc
+
+	// Create response with leader information
+	response := discovery.NodeJoinResponse{
+		Success: true,
+		Message: "Join request accepted",
+		Leader:  h.raftNode.getLocalURL(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// Helper to get leader URL
+func (h *httpKVAPI) getLeaderURL() (string, error) {
+	return h.raftNode.getLeaderURL()
+}
+
 // serveHttpKVAPI starts a key-value server with a GET/PUT API and listens.
-func serveHttpKVAPI(logger *zap.Logger, kv *kvstore, port int, confChangeC chan<- raftpb.ConfChange, errorC <-chan error) {
+func serveHttpKVAPI(logger *zap.Logger, kv *kvstore, raftNode *raftNode, port int, confChangeC chan<- raftpb.ConfChange, errorC <-chan error) {
 	srv := http.Server{
 		Addr: ":" + strconv.Itoa(port),
 		Handler: &httpKVAPI{
 			store:       kv,
 			confChangeC: confChangeC,
+			raftNode:    raftNode, // Pass the raftNode
 			logger:      logger,
 		},
 	}

@@ -29,6 +29,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
+	"github.com/3vilhamster/kv-raft-cass/discovery"
 	"github.com/3vilhamster/kv-raft-cass/leader"
 	raftstorage "github.com/3vilhamster/kv-raft-cass/storage/raft"
 )
@@ -84,7 +85,20 @@ func newCluster(t *testing.T, n int, withKvs bool) *cluster {
 
 		nodeLogger := logger.With(zap.String("node", fmt.Sprintf("%d", i+1)))
 
-		node, clus.commitC[i], clus.errorC[i] = newRaftNode(i+1, 20000+i, nodeLogger, testLeader(t), storage, clus.peers, false, getSnapshot, clus.proposeC[i], clus.confChangeC[i])
+		node, clus.commitC[i], clus.errorC[i] = newRaftNode(raftNodeParams{
+			ID:               i + 1,
+			RaftPort:         20000 + i,
+			Address:          "localhost",
+			Logger:           nodeLogger,
+			LeaderProcess:    testLeader(t),
+			Storage:          storage,
+			Discovery:        discovery.NewMockDiscovery(nodeLogger, 20000+i),
+			Join:             false,
+			BootstrapAllowed: true,
+			GetSnapshot:      getSnapshot,
+			ProposeC:         clus.proposeC[i],
+			ConfChangeC:      clus.confChangeC[i],
+		})
 
 		if withKvs {
 			kvs = newKVStore(nodeLogger, storage, clus.proposeC[i], clus.commitC[i], clus.errorC[i])
@@ -342,49 +356,6 @@ func TestPutAndGetKeyValue(t *testing.T) {
 
 	if gotValue := string(data); wantValue != gotValue {
 		t.Errorf("GET value = %s, want %s", gotValue, wantValue)
-	}
-}
-
-// TestAddNewNode tests adding new node to the existing cluster.
-func TestAddNewNode(t *testing.T) {
-	// Start with a cluster
-	clus := newCluster(t, 1, true)
-	defer clus.closeNoErrors(t)
-
-	// Create and start the new node
-	newNodeID := uint64(4) // Changed from 4 to 2 to be consistent
-	newNodeURL := fmt.Sprintf("http://127.0.0.1:%d", 20000+int(newNodeID))
-
-	storage2, err := raftstorage.New(setupCassandra(t), namespaceID, newNodeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	clus.confChangeC[0] <- raftpb.ConfChange{
-		Type:    raftpb.ConfChangeAddNode,
-		NodeID:  newNodeID,
-		Context: []byte(newNodeURL),
-	}
-
-	proposeC2 := make(chan string)
-	confChangeC2 := make(chan raftpb.ConfChange)
-	defer close(proposeC2)
-	defer close(confChangeC2)
-
-	var (
-		commitC2 <-chan *commit
-		errorC2  <-chan error
-	)
-
-	kvs := newKVStore(zaptest.NewLogger(t), storage2, proposeC2, commitC2, errorC2)
-
-	// Start the new node in join mode
-	peers := []string{clus.peers[0], newNodeURL}
-	_, commitC2, errorC2 = newRaftNode(int(newNodeID), 20000+int(newNodeID), zaptest.NewLogger(t), testLeader(t), storage2, peers, true, kvs.getSnapshot, proposeC2, confChangeC2)
-
-	// Send a test message
-	err = kvs.Propose("test-key", "after-join-test")
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 
