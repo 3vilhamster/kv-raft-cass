@@ -1,7 +1,6 @@
 package discovery
 
 import (
-	"net"
 	"testing"
 	"time"
 
@@ -71,26 +70,14 @@ func (r *mockDNSResolver) LookupHost(host string) ([]string, error) {
 	return []string{"127.0.0.1"}, nil
 }
 
-// Replace the net.LookupHost function with our mock implementation
-func mockLookup() func() {
-	original := net.LookupHost
-	net.LookupHost = func(host string) ([]string, error) {
-		return []string{"127.0.0.1"}, nil
-	}
-
-	return func() {
-		net.LookupHost = original
-	}
-}
-
 // TestDNSDiscoveryWithMockResolver tests with a custom DNS resolver
 func TestDNSDiscoveryWithMockResolver(t *testing.T) {
-	// Replace the DNS lookup function with our mock
-	cleanup := mockLookup()
-	defer cleanup()
-
 	logger := zaptest.NewLogger(t)
 	discovery := NewDNSDiscovery("raft-service.test", 9021, 9121, logger)
+
+	discovery.lookUpHostFn = func(host string) ([]string, error) {
+		return []string{"127.0.0.1"}, nil
+	}
 
 	// Should now always return 127.0.0.1
 	nodes, err := discovery.GetClusterNodes()

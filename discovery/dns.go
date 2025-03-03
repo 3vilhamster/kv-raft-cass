@@ -24,6 +24,8 @@ type DNSDiscovery struct {
 	cacheExpiry time.Duration
 	lastLookup  time.Time
 	cachedNodes []string
+
+	lookUpHostFn func(host string) (addrs []string, err error)
 }
 
 // NodeJoinRequest represents a request to join the Raft cluster
@@ -42,11 +44,12 @@ type NodeJoinResponse struct {
 // NewDNSDiscovery creates a new DNS-based discovery service
 func NewDNSDiscovery(dnsName string, raftPort, httpPort int, logger *zap.Logger) *DNSDiscovery {
 	return &DNSDiscovery{
-		dnsName:     dnsName,
-		raftPort:    raftPort,
-		httpPort:    httpPort,
-		logger:      logger,
-		cacheExpiry: 30 * time.Second,
+		dnsName:      dnsName,
+		raftPort:     raftPort,
+		httpPort:     httpPort,
+		logger:       logger,
+		cacheExpiry:  30 * time.Second,
+		lookUpHostFn: net.LookupHost,
 	}
 }
 
@@ -62,7 +65,7 @@ func (d *DNSDiscovery) GetClusterNodes() ([]string, error) {
 	d.mu.RUnlock()
 
 	// Perform DNS lookup to get all IPs
-	ips, err := net.LookupHost(d.dnsName)
+	ips, err := d.lookUpHostFn(d.dnsName)
 	if err != nil {
 		return nil, fmt.Errorf("DNS lookup failed: %w", err)
 	}
@@ -89,7 +92,7 @@ func (d *DNSDiscovery) GetClusterNodes() ([]string, error) {
 // GetJoinEndpoints returns HTTP endpoints for join requests
 func (d *DNSDiscovery) GetJoinEndpoints() ([]string, error) {
 	// Get IPs same as above
-	ips, err := net.LookupHost(d.dnsName)
+	ips, err := d.lookUpHostFn(d.dnsName)
 	if err != nil {
 		return nil, fmt.Errorf("DNS lookup failed: %w", err)
 	}
