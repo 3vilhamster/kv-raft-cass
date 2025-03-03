@@ -12,9 +12,9 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
-	"github.com/3vilhamster/kv-raft-cass/discovery"
-
-	raftstorage "github.com/3vilhamster/kv-raft-cass/storage/raft"
+	discovery2 "github.com/3vilhamster/kv-raft-cass/pkg/discovery"
+	raft2 "github.com/3vilhamster/kv-raft-cass/pkg/raft"
+	raftstorage "github.com/3vilhamster/kv-raft-cass/pkg/storage/raft"
 )
 
 // TestDynamicNodeJoin tests adding a new node to the cluster using DNS discovery
@@ -27,7 +27,7 @@ func TestDynamicNodeJoin(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 
 	// Create a mock discovery service
-	mockDiscovery := discovery.NewMockDiscovery(logger, 20000)
+	mockDiscovery := discovery2.NewMockDiscovery(logger, 20000)
 
 	// Start a single-node cluster first
 	cluster1 := newClusterWithDiscovery(t, 1, true, mockDiscovery)
@@ -41,7 +41,7 @@ func TestDynamicNodeJoin(t *testing.T) {
 	// Get the leader ID
 	var leaderID int
 	for i, node := range cluster1.nodes {
-		if node.isLeader() {
+		if node.IsLeader() {
 			leaderID = i + 1
 		}
 	}
@@ -81,13 +81,13 @@ func TestDynamicNodeJoin(t *testing.T) {
 	mockDiscovery.AddNode(1, nodeAddr, 20000)
 
 	// Start node 2 HTTP server first to listen for requests
-	node2ID := 2
+	node2ID := uint64(2)
 	node2RaftPort := 20001
 	node2HTTPPort := 20002
 	node2Address := fmt.Sprintf("%s:%d", nodeAddr, node2RaftPort)
 
 	// Create node 2's storage
-	storage2, err := raftstorage.New(sess, namespaceID, uint64(node2ID))
+	storage2, err := raftstorage.New(sess, namespaceID, node2ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,9 +109,9 @@ func TestDynamicNodeJoin(t *testing.T) {
 	defer node2Server.Close()
 
 	// Start node 2 with discovery and joining
-	node2, commitC2, errorC2 := newRaftNode(
-		raftNodeParams{
-			ID:               node2ID,
+	node2, commitC2, errorC2 := raft2.New(
+		raft2.Config{
+			NodeID:           node2ID,
 			RaftPort:         node2RaftPort,
 			Address:          node2Address,
 			Logger:           node2Logger,
@@ -121,9 +121,7 @@ func TestDynamicNodeJoin(t *testing.T) {
 			Join:             true,
 			BootstrapAllowed: false,
 			GetSnapshot:      getSnapshot2,
-			ProposeC:         proposeC2,
-			ConfChangeC:      confChangeC2,
-		},
+		}, proposeC2, confChangeC2,
 	)
 
 	// Create KV store for node 2
@@ -135,13 +133,13 @@ func TestDynamicNodeJoin(t *testing.T) {
 	httpHandler.raftNode = node2
 
 	// Register node 2 in the discovery service
-	mockDiscovery.AddNode(uint64(node2ID), nodeAddr, node2HTTPPort)
+	mockDiscovery.AddNode(node2ID, nodeAddr, node2HTTPPort)
 
 	// Manually send a direct ConfChange to node 1 to add node 2
 	// This helps ensure immediate joining without waiting for discovery
 	cc := raftpb.ConfChange{
 		Type:    raftpb.ConfChangeAddNode,
-		NodeID:  uint64(node2ID),
+		NodeID:  node2ID,
 		Context: []byte(fmt.Sprintf("http://%s", node2Address)),
 	}
 
@@ -156,8 +154,8 @@ func TestDynamicNodeJoin(t *testing.T) {
 
 	for time.Now().Before(deadline) {
 		// Check if node 2 is in node 1's conf state
-		if len(cluster1.nodes[0].confState.Voters) > 1 {
-			for _, voterID := range cluster1.nodes[0].confState.Voters {
+		if len(cluster1.nodes[0].ConfState().Voters) > 1 {
+			for _, voterID := range cluster1.nodes[0].ConfState().Voters {
 				if voterID == uint64(node2ID) {
 					t.Logf("Node %d is now part of cluster configuration", node2ID)
 					success = true
@@ -196,7 +194,7 @@ func TestDynamicNodeJoin(t *testing.T) {
 }
 
 // newClusterWithDiscovery creates a cluster with a custom discovery service
-func newClusterWithDiscovery(t *testing.T, n int, withKvs bool, discoveryService discovery.Discovery) *cluster {
+func newClusterWithDiscovery(t *testing.T, n int, withKvs bool, discoveryService discovery2.Discovery) *cluster {
 	peers := make([]string, n)
 	for i := range peers {
 		peers[i] = fmt.Sprintf("http://127.0.0.1:%d", 20000+i)
@@ -204,7 +202,7 @@ func newClusterWithDiscovery(t *testing.T, n int, withKvs bool, discoveryService
 
 	clus := &cluster{
 		peers:       peers,
-		commitC:     make([]<-chan *commit, len(peers)),
+		commitC:     make([]<-chan *raft2.Commit, len(peers)),
 		errorC:      make([]<-chan error, len(peers)),
 		proposeC:    make([]chan string, len(peers)),
 		confChangeC: make([]chan raftpb.ConfChange, len(peers)),
@@ -227,7 +225,7 @@ func newClusterWithDiscovery(t *testing.T, n int, withKvs bool, discoveryService
 
 		var (
 			kvs  *kvstore
-			node *raftNode
+			node raft2.Node
 		)
 
 		getSnapshot := func() ([]byte, error) { return nil, nil }
@@ -235,9 +233,9 @@ func newClusterWithDiscovery(t *testing.T, n int, withKvs bool, discoveryService
 		nodeLogger := logger.With(zap.String("node", fmt.Sprintf("%d", i+1)))
 		nodeAddress := fmt.Sprintf("127.0.0.1:%d", 20000+i)
 
-		node, clus.commitC[i], clus.errorC[i] = newRaftNode(
-			raftNodeParams{
-				ID:               i + 1,
+		node, clus.commitC[i], clus.errorC[i] = raft2.New(
+			raft2.Config{
+				NodeID:           uint64(i + 1),
 				RaftPort:         20000 + i,
 				Address:          nodeAddress,
 				Logger:           nodeLogger,
@@ -247,9 +245,9 @@ func newClusterWithDiscovery(t *testing.T, n int, withKvs bool, discoveryService
 				Join:             false,
 				BootstrapAllowed: true,
 				GetSnapshot:      getSnapshot,
-				ProposeC:         clus.proposeC[i],
-				ConfChangeC:      clus.confChangeC[i],
 			},
+			clus.proposeC[i],
+			clus.confChangeC[i],
 		)
 
 		if withKvs {
@@ -266,7 +264,7 @@ func newClusterWithDiscovery(t *testing.T, n int, withKvs bool, discoveryService
 }
 
 // waitForLeader waits for a leader to be elected in the cluster
-func waitForLeader(t *testing.T, nodes []*raftNode, timeout time.Duration) bool {
+func waitForLeader(t *testing.T, nodes []raft2.Node, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	firstTry := true
 
@@ -280,7 +278,7 @@ func waitForLeader(t *testing.T, nodes []*raftNode, timeout time.Duration) bool 
 		leaderCount := 0
 		var leaderId int
 		for i, node := range nodes {
-			if node.isLeader() {
+			if node.IsLeader() {
 				leaderCount++
 				leaderId = i + 1
 			}

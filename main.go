@@ -23,11 +23,12 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.uber.org/zap"
 
-	"github.com/3vilhamster/kv-raft-cass/discovery"
-
-	"github.com/3vilhamster/kv-raft-cass/leader"
-	raftstorage "github.com/3vilhamster/kv-raft-cass/storage/raft"
+	"github.com/3vilhamster/kv-raft-cass/pkg/discovery"
+	"github.com/3vilhamster/kv-raft-cass/pkg/raft"
+	raftstorage "github.com/3vilhamster/kv-raft-cass/pkg/storage/raft"
 )
+
+const namespaceID = "test"
 
 func main() {
 	// Original parameters
@@ -96,16 +97,16 @@ func main() {
 	}
 
 	// Setup leader process
-	leaderProcess := leader.NewLeaderProcess(
+	leaderProcess := raft.NewLeaderProcess(
 		logger,
 		func(ctx context.Context) error {
 			return nil
 		})
 
 	// Initialize raft node with discovery
-	node, commitC, errorC := newRaftNode(
-		raftNodeParams{
-			ID:               *id,
+	node, commitC, errorC := raft.New(
+		raft.Config{
+			NodeID:           uint64(*id),
 			RaftPort:         *raftPort,
 			Address:          nodeAddress,
 			Logger:           logger,
@@ -115,10 +116,7 @@ func main() {
 			Join:             *join,
 			BootstrapAllowed: *bootstrapAllowed,
 			GetSnapshot:      getSnapshot,
-			ProposeC:         proposeC,
-			ConfChangeC:      confChangeC,
-		},
-	)
+		}, proposeC, confChangeC)
 
 	// Initialize key-value store
 	kvs = newKVStore(logger, storage, proposeC, commitC, errorC)

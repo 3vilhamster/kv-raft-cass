@@ -1,4 +1,4 @@
-package leader
+package raft
 
 import (
 	"context"

@@ -25,7 +25,8 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.uber.org/zap"
 
-	"github.com/3vilhamster/kv-raft-cass/storage"
+	"github.com/3vilhamster/kv-raft-cass/pkg/raft"
+	"github.com/3vilhamster/kv-raft-cass/pkg/storage"
 )
 
 // a key-value store backed by raft
@@ -41,7 +42,7 @@ type kvstore struct {
 	proposals sync.Map // map[string]chan error
 }
 
-func newKVStore(logger *zap.Logger, snapshotter storage.Raft, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
+func newKVStore(logger *zap.Logger, snapshotter storage.Raft, proposeC chan<- string, commitC <-chan *raft.Commit, errorC <-chan error) *kvstore {
 	s := &kvstore{
 		proposeC: proposeC,
 		kvStore:  make(map[string]string),
@@ -153,7 +154,7 @@ func (s *kvstore) Propose(k string, v string) error {
 	}
 }
 
-func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
+func (s *kvstore) readCommits(commitC <-chan *raft.Commit, errorC <-chan error) {
 	for commit := range commitC {
 		s.logger.Debug("commit received")
 
@@ -176,11 +177,11 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 		}
 
 		s.logger.Debug("commit with data",
-			zap.Int("data_count", len(commit.data)))
+			zap.Int("data_count", len(commit.Data)))
 
 		// Process all data in the commit before signaling completion
-		processed := make([]string, 0, len(commit.data))
-		for _, data := range commit.data {
+		processed := make([]string, 0, len(commit.Data))
+		for _, data := range commit.Data {
 			var proposal struct {
 				ID  string `json:"id"`
 				Key string `json:"key"`
@@ -226,8 +227,8 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 		}
 
 		// Signal apply completion after all processing is done
-		if commit.applyDoneC != nil {
-			close(commit.applyDoneC)
+		if commit.ApplyDoneC != nil {
+			close(commit.ApplyDoneC)
 		}
 	}
 

@@ -11,7 +11,7 @@ import (
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 
-	"github.com/3vilhamster/kv-raft-cass/storage"
+	"github.com/3vilhamster/kv-raft-cass/pkg/storage"
 )
 
 var _ storage.Raft = (*Storage)(nil)

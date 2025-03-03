@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +23,9 @@ type DNSDiscovery struct {
 	cacheExpiry time.Duration
 	lastLookup  time.Time
 	cachedNodes []string
+
+	// Add a map to store node ID to URL mappings
+	nodeIDToURL map[uint64]string
 
 	lookUpHostFn func(host string) (addrs []string, err error)
 }
@@ -50,6 +52,7 @@ func NewDNSDiscovery(dnsName string, raftPort, httpPort int, logger *zap.Logger)
 		logger:       logger,
 		cacheExpiry:  30 * time.Second,
 		lookUpHostFn: net.LookupHost,
+		nodeIDToURL:  make(map[uint64]string),
 	}
 }
 
@@ -166,6 +169,11 @@ func (d *DNSDiscovery) JoinCluster(nodeID uint64, raftAddress string, backoff ti
 					}
 				}
 
+				// After a successful join, update the nodeID to URL mapping
+				d.mu.Lock()
+				d.nodeIDToURL[nodeID] = fmt.Sprintf("http://%s", raftAddress)
+				d.mu.Unlock()
+
 				return nil
 			}
 
@@ -196,20 +204,23 @@ func (d *DNSDiscovery) JoinCluster(nodeID uint64, raftAddress string, backoff ti
 	return fmt.Errorf("failed to join cluster after %d retries", maxRetries)
 }
 
-// ExtractIPFromURL extracts the IP address from a URL
-func ExtractIPFromURL(url string) string {
-	// Strip protocol if present
-	if strings.HasPrefix(url, "http://") {
-		url = url[7:]
-	} else if strings.HasPrefix(url, "https://") {
-		url = url[8:]
+// GetNodeURL returns the URL for a specific node ID
+func (d *DNSDiscovery) GetNodeURL(nodeID uint64) (string, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Check if we have a cached mapping of node IDs to URLs
+	if d.nodeIDToURL != nil {
+		if url, ok := d.nodeIDToURL[nodeID]; ok {
+			return url, nil
+		}
 	}
 
-	// Extract host part (remove path if any)
-	host := strings.Split(url, "/")[0]
+	// If we don't have a mapping, we can't determine the URL
+	// This is a limitation that would need to be addressed by maintaining
+	// a mapping of node IDs to URLs as nodes join and leave the cluster
+	d.logger.Debug("no mapping found for node ID",
+		zap.Uint64("node_id", nodeID))
 
-	// Handle port if present
-	host = strings.Split(host, ":")[0]
-
-	return host
+	return "", fmt.Errorf("no URL mapping found for node ID %d", nodeID)
 }

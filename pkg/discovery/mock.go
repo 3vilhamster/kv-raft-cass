@@ -169,3 +169,19 @@ func (m *MockDiscovery) JoinCluster(nodeID uint64, raftAddress string, backoff t
 
 	return fmt.Errorf("failed to join mock cluster after %d retries", maxRetries)
 }
+
+// GetNodeURL returns the URL for a specific node ID
+func (m *MockDiscovery) GetNodeURL(nodeID uint64) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// In MockDiscovery, we already have a mapping of URLs to node IDs (m.nodes)
+	// We need to find the address that corresponds to the given nodeID
+	for addr, id := range m.nodes {
+		if id == nodeID {
+			return fmt.Sprintf("http://%s:%d", addr, m.raftPort), nil
+		}
+	}
+
+	return "", fmt.Errorf("no URL found for node ID %d", nodeID)
+}

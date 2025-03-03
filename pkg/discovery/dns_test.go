@@ -41,27 +41,6 @@ func TestDNSDiscovery(t *testing.T) {
 	}
 }
 
-// TestExtractIPFromURL tests the URL parsing helper
-func TestExtractIPFromURL(t *testing.T) {
-	testCases := []struct {
-		url      string
-		expected string
-	}{
-		{"http://192.168.1.1:8080", "192.168.1.1"},
-		{"https://example.com:443", "example.com"},
-		{"192.168.1.1:8080", "192.168.1.1"},
-		{"example.com", "example.com"},
-		{"http://localhost/path", "localhost"},
-	}
-
-	for _, tc := range testCases {
-		result := ExtractIPFromURL(tc.url)
-		if result != tc.expected {
-			t.Errorf("ExtractIPFromURL(%s) = %s; want %s", tc.url, result, tc.expected)
-		}
-	}
-}
-
 // Setup a custom DNS resolver for testing if needed
 type mockDNSResolver struct{}
 

@@ -12,4 +12,7 @@ type Discovery interface {
 
 	// JoinCluster attempts to join the cluster with the given node information
 	JoinCluster(nodeID uint64, raftAddress string, initialBackoff time.Duration, maxRetries int) error
+
+	// GetNodeURL returns the URL for a specific node ID
+	GetNodeURL(nodeID uint64) (string, error)
 }

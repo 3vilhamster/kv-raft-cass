@@ -27,14 +27,15 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.uber.org/zap"
 
-	"github.com/3vilhamster/kv-raft-cass/discovery"
+	"github.com/3vilhamster/kv-raft-cass/pkg/discovery"
+	raft2 "github.com/3vilhamster/kv-raft-cass/pkg/raft"
 )
 
 // Handler for a http based key-value store backed by raft
 type httpKVAPI struct {
 	store       *kvstore
 	confChangeC chan<- raftpb.ConfChange
-	raftNode    *raftNode // Added to access raftNode methods
+	raftNode    raft2.Node // Added to access raft.Node methods
 	logger      *zap.Logger
 }
 
@@ -157,9 +158,9 @@ func (h *httpKVAPI) handleJoin(w http.ResponseWriter, r *http.Request) {
 		zap.String("url", req.NodeURL))
 
 	// Forward to leader if we're not the leader
-	if h.raftNode != nil && !h.raftNode.isLeader() {
+	if h.raftNode != nil && !h.raftNode.IsLeader() {
 		h.logger.Info("forwarding join request to leader")
-		leaderURL, err := h.raftNode.getLeaderURL()
+		leaderURL, err := h.raftNode.GetLeaderURL()
 		if err != nil {
 			h.logger.Error("failed to get leader URL", zap.Error(err))
 			http.Error(w, "Cannot determine leader", http.StatusServiceUnavailable)
@@ -213,7 +214,7 @@ func (h *httpKVAPI) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 	// Include leader URL if available
 	if h.raftNode != nil {
-		response.Leader = h.raftNode.getLocalURL()
+		response.Leader = h.raftNode.GetLocalURL()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -221,13 +222,8 @@ func (h *httpKVAPI) handleJoin(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// Helper to get leader URL
-func (h *httpKVAPI) getLeaderURL() (string, error) {
-	return h.raftNode.getLeaderURL()
-}
-
 // serveHttpKVAPI starts a key-value server with a GET/PUT API and listens.
-func serveHttpKVAPI(logger *zap.Logger, kv *kvstore, raftNode *raftNode, port int, confChangeC chan<- raftpb.ConfChange, errorC <-chan error) {
+func serveHttpKVAPI(logger *zap.Logger, kv *kvstore, raftNode raft2.Node, port int, confChangeC chan<- raftpb.ConfChange, errorC <-chan error) {
 	srv := http.Server{
 		Addr: ":" + strconv.Itoa(port),
 		Handler: &httpKVAPI{

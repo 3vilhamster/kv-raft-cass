@@ -29,19 +29,19 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
-	"github.com/3vilhamster/kv-raft-cass/discovery"
-	"github.com/3vilhamster/kv-raft-cass/leader"
-	raftstorage "github.com/3vilhamster/kv-raft-cass/storage/raft"
+	"github.com/3vilhamster/kv-raft-cass/pkg/discovery"
+	"github.com/3vilhamster/kv-raft-cass/pkg/raft"
+	raftstorage "github.com/3vilhamster/kv-raft-cass/pkg/storage/raft"
 )
 
 type cluster struct {
 	peers       []string
-	commitC     []<-chan *commit
+	commitC     []<-chan *raft.Commit
 	errorC      []<-chan error
 	proposeC    []chan string
 	confChangeC []chan raftpb.ConfChange
 	kvs         []*kvstore
-	nodes       []*raftNode
+	nodes       []raft.Node
 	address     string
 }
 
@@ -54,7 +54,7 @@ func newCluster(t *testing.T, n int, withKvs bool) *cluster {
 
 	clus := &cluster{
 		peers:       peers,
-		commitC:     make([]<-chan *commit, len(peers)),
+		commitC:     make([]<-chan *raft.Commit, len(peers)),
 		errorC:      make([]<-chan error, len(peers)),
 		proposeC:    make([]chan string, len(peers)),
 		confChangeC: make([]chan raftpb.ConfChange, len(peers)),
@@ -78,27 +78,26 @@ func newCluster(t *testing.T, n int, withKvs bool) *cluster {
 
 		var (
 			kvs  *kvstore
-			node *raftNode
+			node raft.Node
 		)
 
 		getSnapshot := func() ([]byte, error) { return nil, nil }
 
 		nodeLogger := logger.With(zap.String("node", fmt.Sprintf("%d", i+1)))
 
-		node, clus.commitC[i], clus.errorC[i] = newRaftNode(raftNodeParams{
-			ID:               i + 1,
-			RaftPort:         20000 + i,
-			Address:          "localhost",
-			Logger:           nodeLogger,
-			LeaderProcess:    testLeader(t),
-			Storage:          storage,
-			Discovery:        discovery.NewMockDiscovery(nodeLogger, 20000+i),
-			Join:             false,
-			BootstrapAllowed: true,
-			GetSnapshot:      getSnapshot,
-			ProposeC:         clus.proposeC[i],
-			ConfChangeC:      clus.confChangeC[i],
-		})
+		node, clus.commitC[i], clus.errorC[i] = raft.New(
+			raft.Config{
+				NodeID:           uint64(i + 1),
+				RaftPort:         20000 + i,
+				Address:          "localhost",
+				Logger:           nodeLogger,
+				LeaderProcess:    testLeader(t),
+				Storage:          storage,
+				Discovery:        discovery.NewMockDiscovery(nodeLogger, 20000+i),
+				Join:             false,
+				BootstrapAllowed: true,
+				GetSnapshot:      getSnapshot,
+			}, clus.proposeC[i], clus.confChangeC[i])
 
 		if withKvs {
 			kvs = newKVStore(nodeLogger, storage, clus.proposeC[i], clus.commitC[i], clus.errorC[i])
@@ -124,7 +123,7 @@ func newCluster(t *testing.T, n int, withKvs bool) *cluster {
 			leaderCount := 0
 			var leaderId int
 			for i, node := range clus.nodes {
-				if node.isLeader() {
+				if node.IsLeader() {
 					leaderCount++
 					leaderId = i + 1
 				}
@@ -191,14 +190,14 @@ func TestProposeOnCommit(t *testing.T) {
 	donec := make(chan struct{})
 	for i := range clus.peers {
 		// feedback for "n" committed entries, then update donec
-		go func(pC chan<- string, cC <-chan *commit, eC <-chan error) {
+		go func(pC chan<- string, cC <-chan *raft.Commit, eC <-chan error) {
 			for n := 0; n < 100; n++ {
 				c, ok := <-cC
 				if !ok {
 					pC = nil
 				}
 				select {
-				case pC <- c.data[0]:
+				case pC <- c.Data[0]:
 					continue
 				case err := <-eC:
 					t.Errorf("eC message (%v)", err)
@@ -250,7 +249,7 @@ func TestCloseProposerInflight(t *testing.T) {
 			if c == nil {
 				continue
 			}
-			for _, data := range c.data {
+			for _, data := range c.Data {
 				t.Logf("Commit received: %q", data)
 				commitc <- data
 			}
@@ -360,13 +359,6 @@ func TestPutAndGetKeyValue(t *testing.T) {
 }
 
 func TestSnapshot(t *testing.T) {
-	// Override defaults for testing
-	prevDefaultSnapshotCount := defaultSnapshotCount
-	defaultSnapshotCount = 4
-	defer func() {
-		defaultSnapshotCount = prevDefaultSnapshotCount
-	}()
-
 	// Create cluster
 	clus := newCluster(t, 1, false)
 	defer func() {
@@ -382,9 +374,9 @@ func TestSnapshot(t *testing.T) {
 
 		// Wait for response
 		for c := range clus.commitC[0] {
-			if c != nil && len(c.data) > 0 {
-				if c.applyDoneC != nil {
-					close(c.applyDoneC)
+			if c != nil && len(c.Data) > 0 {
+				if c.ApplyDoneC != nil {
+					close(c.ApplyDoneC)
 				}
 				close(snapshotTriggered)
 				return
@@ -445,8 +437,8 @@ func sampleData(key string) string {
 	return fmt.Sprintf(`{"key": "%s", "val": "sample-value"}`, key)
 }
 
-func testLeader(t *testing.T) LeaderProcess {
-	return leader.NewLeaderProcess(zaptest.NewLogger(t), func(ctx context.Context) error {
+func testLeader(t *testing.T) raft.LeaderProcess {
+	return raft.NewLeaderProcess(zaptest.NewLogger(t), func(ctx context.Context) error {
 		return nil
 	})
 }
