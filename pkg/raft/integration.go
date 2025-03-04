@@ -3,10 +3,13 @@ package raft
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"go.etcd.io/etcd/client/pkg/v3/types"
@@ -68,23 +71,57 @@ func (n *node) initTransport() {
 		ErrorC:      make(chan error),
 	}
 
+	// Start the transport before adding peers
 	err := n.transport.Start()
 	if err != nil {
 		n.logger.Fatal("rafthttp.Transport.Start", zap.Error(err))
 	}
+
+	// Add peers to transport if using discovery
+	if n.discovery != nil {
+		nodes, err := n.discovery.GetClusterNodes()
+		if err == nil {
+			for i, url := range nodes {
+				peerID := uint64(i + 1)
+				if peerID != n.id { // Don't add ourselves
+					n.logger.Info("adding peer to transport during init",
+						zap.Uint64("peer_id", peerID),
+						zap.String("url", url))
+
+					// Register peer in transport
+					n.transport.AddPeer(types.ID(peerID), []string{url})
+				}
+			}
+		}
+	}
 }
 
 // serveRaft starts the HTTP server for Raft communication
-func (n *node) serveRaft() {
-	url, err := url.Parse("http://0.0.0.0:" + strconv.Itoa(n.raftPort))
+func (n *node) serveRaft(w *sync.WaitGroup) {
+	// Use "localhost" instead of "0.0.0.0" to ensure consistent behavior in tests
+	host := "localhost"
+	if strings.Contains(n.address, ":") {
+		parts := strings.Split(n.address, ":")
+		if len(parts) == 2 && parts[0] != "" {
+			host = parts[0]
+		}
+	}
+
+	listenAddr := fmt.Sprintf("%s:%d", host, n.raftPort)
+	url, err := url.Parse("http://" + listenAddr)
 	if err != nil {
 		n.logger.Sugar().Fatalf("Failed parsing URL (%v)", err)
 	}
+
+	n.logger.Info("starting raft HTTP server", zap.String("listen_addr", listenAddr))
 
 	ln, err := newStoppableListener(url.Host, n.httpstopc)
 	if err != nil {
 		n.logger.Sugar().Fatalf("Failed to listen rafthttp (%v)", err)
 	}
+
+	// Signal that this server is now listening
+	w.Done()
 
 	err = (&http.Server{Handler: n.transport.Handler()}).Serve(ln)
 	select {

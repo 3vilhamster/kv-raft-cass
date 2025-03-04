@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -33,153 +34,6 @@ import (
 	"github.com/3vilhamster/kv-raft-cass/pkg/raft"
 	raftstorage "github.com/3vilhamster/kv-raft-cass/pkg/storage/raft"
 )
-
-type cluster struct {
-	peers       []string
-	commitC     []<-chan *raft.Commit
-	errorC      []<-chan error
-	proposeC    []chan string
-	confChangeC []chan raftpb.ConfChange
-	kvs         []*kvstore
-	nodes       []raft.Node
-	address     string
-}
-
-// newCluster creates a cluster of n nodes
-func newCluster(t *testing.T, n int, withKvs bool) *cluster {
-	peers := make([]string, n)
-	for i := range peers {
-		peers[i] = fmt.Sprintf("http://127.0.0.1:%d", 20000+i)
-	}
-
-	clus := &cluster{
-		peers:       peers,
-		commitC:     make([]<-chan *raft.Commit, len(peers)),
-		errorC:      make([]<-chan error, len(peers)),
-		proposeC:    make([]chan string, len(peers)),
-		confChangeC: make([]chan raftpb.ConfChange, len(peers)),
-		address:     peers[0],
-	}
-
-	sess := setupCassandra(t)
-
-	cleanupTestState(t, sess)
-
-	logger := zaptest.NewLogger(t)
-
-	for i := range clus.peers {
-		clus.proposeC[i] = make(chan string, 1)
-		clus.confChangeC[i] = make(chan raftpb.ConfChange, 1)
-
-		storage, err := raftstorage.New(sess, namespaceID, uint64(i+1))
-		if err != nil {
-			panic(err)
-		}
-
-		var (
-			kvs  *kvstore
-			node raft.Node
-		)
-
-		getSnapshot := func() ([]byte, error) { return nil, nil }
-
-		nodeLogger := logger.With(zap.String("node", fmt.Sprintf("%d", i+1)))
-
-		node, clus.commitC[i], clus.errorC[i] = raft.New(
-			raft.Config{
-				NodeID:           uint64(i + 1),
-				RaftPort:         20000 + i,
-				Address:          "localhost",
-				Logger:           nodeLogger,
-				LeaderProcess:    testLeader(t),
-				Storage:          storage,
-				Discovery:        discovery.NewMockDiscovery(nodeLogger, 20000+i),
-				Join:             false,
-				BootstrapAllowed: true,
-				GetSnapshot:      getSnapshot,
-			}, clus.proposeC[i], clus.confChangeC[i])
-
-		if withKvs {
-			kvs = newKVStore(nodeLogger, storage, clus.proposeC[i], clus.commitC[i], clus.errorC[i])
-			getSnapshot = func() ([]byte, error) { return kvs.getSnapshot() }
-		}
-
-		clus.nodes = append(clus.nodes, node)
-		clus.kvs = append(clus.kvs, kvs)
-	}
-
-	// Wait for cluster to stabilize and elect a leader
-	waitForLeader := func() bool {
-		deadline := time.Now().Add(5 * time.Second)
-		firstTry := true
-
-		for time.Now().Before(deadline) {
-			if firstTry {
-				// Let HTTP server start up on first try
-				time.Sleep(500 * time.Millisecond)
-				firstTry = false
-			}
-
-			leaderCount := 0
-			var leaderId int
-			for i, node := range clus.nodes {
-				if node.IsLeader() {
-					leaderCount++
-					leaderId = i + 1
-				}
-			}
-
-			if leaderCount == 1 {
-				logger.Info("leader elected",
-					zap.Int("leader_id", leaderId),
-					zap.Duration("elapsed", time.Since(deadline.Add(-5*time.Second))))
-				return true
-			}
-
-			if leaderCount > 1 {
-				logger.Warn("multiple leaders detected",
-					zap.Int("count", leaderCount))
-			}
-
-			time.Sleep(100 * time.Millisecond)
-		}
-		return false
-	}
-
-	if !waitForLeader() {
-		t.Error("No leader elected within timeout")
-		clus.closeNoErrors(t)
-		t.FailNow()
-	}
-
-	return clus
-}
-
-// Close closes all cluster nodes and returns an error if any failed.
-func (cl *cluster) Close() (err error) {
-	for i := range cl.peers {
-		go func(i int) {
-			for range cl.commitC[i] {
-				// drain pending commits
-			}
-		}(i)
-		close(cl.proposeC[i])
-		close(cl.confChangeC[i])
-		// wait for channel to close
-		if erri := <-cl.errorC[i]; erri != nil {
-			err = erri
-		}
-	}
-	return err
-}
-
-func (cl *cluster) closeNoErrors(t *testing.T) {
-	t.Log("closing cluster...")
-	if err := cl.Close(); err != nil {
-		t.Fatal(err)
-	}
-	t.Log("closing cluster [done]")
-}
 
 // TestProposeOnCommit starts three nodes and feeds commits back into the proposal
 // channel. The intent is to ensure blocking on a proposal won't block raft progress.
@@ -441,4 +295,243 @@ func testLeader(t *testing.T) raft.LeaderProcess {
 	return raft.NewLeaderProcess(zaptest.NewLogger(t), func(ctx context.Context) error {
 		return nil
 	})
+}
+
+// getAvailablePorts finds n available TCP ports for testing
+func getAvailablePorts(n int) ([]int, error) {
+	ports := make([]int, n)
+	listeners := make([]*net.TCPListener, n)
+
+	defer func() {
+		// Close all listeners when we're done
+		for _, l := range listeners {
+			if l != nil {
+				l.Close()
+			}
+		}
+	}()
+
+	for i := 0; i < n; i++ {
+		// Find a free port by asking the OS for an available port
+		addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve address: %v", err)
+		}
+
+		listener, err := net.ListenTCP("tcp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to listen: %v", err)
+		}
+
+		// Get the port that was actually assigned
+		port := listener.Addr().(*net.TCPAddr).Port
+		ports[i] = port
+		listeners[i] = listener
+	}
+
+	return ports, nil
+}
+
+type cluster struct {
+	peers       []string
+	commitC     []<-chan *raft.Commit
+	errorC      []<-chan error
+	proposeC    []chan string
+	confChangeC []chan raftpb.ConfChange
+	kvs         []*kvstore
+	nodes       []raft.Node
+	address     string
+}
+
+// newCluster creates a cluster of n nodes with dynamically allocated ports
+func newCluster(t *testing.T, n int, withKvs bool) *cluster {
+	// Allocate 2*n ports: n for Raft communication, n for HTTP API
+	ports, err := getAvailablePorts(n * 2)
+	if err != nil {
+		t.Fatalf("Failed to allocate ports: %v", err)
+	}
+
+	// Split into raft ports and API ports
+	raftPorts := ports[:n]
+	apiPorts := ports[n:]
+
+	t.Logf("Using Raft ports: %v", raftPorts)
+	t.Logf("Using API ports: %v", apiPorts)
+
+	peers := make([]string, n)
+	for i := range peers {
+		peers[i] = fmt.Sprintf("http://localhost:%d", raftPorts[i])
+	}
+
+	clus := &cluster{
+		peers:       peers,
+		commitC:     make([]<-chan *raft.Commit, len(peers)),
+		errorC:      make([]<-chan error, len(peers)),
+		proposeC:    make([]chan string, len(peers)),
+		confChangeC: make([]chan raftpb.ConfChange, len(peers)),
+		address:     peers[0],
+	}
+
+	sess := setupCassandra(t)
+	cleanupTestState(t, sess)
+
+	logger := zaptest.NewLogger(t)
+
+	// Create a shared discovery service for the test cluster
+	mockDiscovery := discovery.NewMockDiscovery(logger, raftPorts[0])
+
+	// Populate the discovery service with all nodes BEFORE creating any nodes
+	for i := range peers {
+		nodeID := uint64(i + 1)
+		mockDiscovery.AddNode(nodeID, "localhost", raftPorts[i])
+		t.Logf("Registered node %d in discovery: localhost:%d", nodeID, raftPorts[i])
+	}
+
+	// Create the first node (bootstrap node) and wait for it to initialize
+	nodeID := uint64(1)
+	nodeLogger := logger.With(zap.String("node", fmt.Sprintf("%d", nodeID)))
+	nodeAddress := fmt.Sprintf("localhost:%d", raftPorts[0])
+
+	storage, err := raftstorage.New(sess, namespaceID, nodeID)
+	if err != nil {
+		t.Fatalf("Failed to create storage for node %d: %v", nodeID, err)
+	}
+
+	clus.proposeC[0] = make(chan string, 1)
+	clus.confChangeC[0] = make(chan raftpb.ConfChange, 1)
+
+	getSnapshot := func() ([]byte, error) { return nil, nil }
+
+	t.Logf("Creating bootstrap node (ID: %d)", nodeID)
+	var node raft.Node
+	node, clus.commitC[0], clus.errorC[0] = raft.New(
+		raft.Config{
+			NodeID:           nodeID,
+			RaftPort:         raftPorts[0],
+			Address:          nodeAddress,
+			Logger:           nodeLogger,
+			LeaderProcess:    testLeader(t),
+			Storage:          storage,
+			Discovery:        mockDiscovery,
+			Join:             false, // First node bootstraps
+			BootstrapAllowed: true,
+			GetSnapshot:      getSnapshot,
+		}, clus.proposeC[0], clus.confChangeC[0])
+
+	clus.nodes = append(clus.nodes, node)
+
+	// Create KVStore for first node if needed
+	var kvs *kvstore
+	if withKvs {
+		kvs = newKVStore(nodeLogger, storage, clus.proposeC[0], clus.commitC[0], clus.errorC[0])
+		getSnapshot = func() ([]byte, error) { return kvs.getSnapshot() }
+	}
+	clus.kvs = append(clus.kvs, kvs)
+
+	// Give the first node time to initialize
+	t.Log("Waiting for bootstrap node to initialize...")
+	time.Sleep(500 * time.Millisecond)
+
+	// Now create and add all other nodes
+	for i := 1; i < n; i++ {
+		nodeID := uint64(i + 1)
+		nodeLogger := logger.With(zap.String("node", fmt.Sprintf("%d", nodeID)))
+		nodeAddress := fmt.Sprintf("localhost:%d", raftPorts[i])
+
+		storage, err := raftstorage.New(sess, namespaceID, nodeID)
+		if err != nil {
+			t.Fatalf("Failed to create storage for node %d: %v", nodeID, err)
+		}
+
+		clus.proposeC[i] = make(chan string, 1)
+		clus.confChangeC[i] = make(chan raftpb.ConfChange, 1)
+
+		getSnapshot := func() ([]byte, error) { return nil, nil }
+
+		t.Logf("Creating node %d", nodeID)
+		node, clus.commitC[i], clus.errorC[i] = raft.New(
+			raft.Config{
+				NodeID:           nodeID,
+				RaftPort:         raftPorts[i],
+				Address:          nodeAddress,
+				Logger:           nodeLogger,
+				LeaderProcess:    testLeader(t),
+				Storage:          storage,
+				Discovery:        mockDiscovery,
+				Join:             true, // Join existing cluster
+				BootstrapAllowed: false,
+				GetSnapshot:      getSnapshot,
+			}, clus.proposeC[i], clus.confChangeC[i])
+
+		if withKvs {
+			kvs := newKVStore(nodeLogger, storage, clus.proposeC[i], clus.commitC[i], clus.errorC[i])
+			getSnapshot = func() ([]byte, error) { return kvs.getSnapshot() }
+			clus.kvs = append(clus.kvs, kvs)
+		} else {
+			clus.kvs = append(clus.kvs, nil)
+		}
+
+		clus.nodes = append(clus.nodes, node)
+
+		// Allow time for this node to connect to the cluster
+		time.Sleep(200 * time.Millisecond)
+
+		// Explicitly add it to the cluster via a configuration change
+		cc := raftpb.ConfChange{
+			Type:    raftpb.ConfChangeAddNode,
+			NodeID:  nodeID,
+			Context: []byte(fmt.Sprintf("http://localhost:%d", raftPorts[i])),
+		}
+
+		// Send the configuration change to the leader (assumed to be node 1)
+		t.Logf("Sending ConfChange to add node %d to the cluster", nodeID)
+		select {
+		case clus.confChangeC[0] <- cc:
+			t.Logf("ConfChange for node %d sent", nodeID)
+		case <-time.After(time.Second):
+			t.Logf("Timeout sending ConfChange for node %d", nodeID)
+		}
+
+		// Give the config change time to propagate
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	// Allow some time for cluster to stabilize before proceeding
+	t.Log("Waiting for cluster to stabilize...")
+	time.Sleep(1 * time.Second)
+
+	// Wait for cluster to elect a leader
+	if !waitForLeader(t, clus.nodes, 10*time.Second) {
+		t.Error("No leader elected within timeout")
+		clus.closeNoErrors(t)
+		t.FailNow()
+	}
+
+	return clus
+}
+
+// Close closes all cluster nodes and returns an error if any failed.
+func (cl *cluster) Close() (err error) {
+	for i := range cl.peers {
+		go func(i int) {
+			for range cl.commitC[i] {
+				// drain pending commits
+			}
+		}(i)
+		close(cl.proposeC[i])
+		close(cl.confChangeC[i])
+		// wait for channel to close
+		if erri := <-cl.errorC[i]; erri != nil {
+			err = erri
+		}
+	}
+	return err
+}
+
+func (cl *cluster) closeNoErrors(t *testing.T) {
+	t.Log("closing cluster...")
+	if err := cl.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("closing cluster [done]")
 }

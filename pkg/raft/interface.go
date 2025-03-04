@@ -36,6 +36,9 @@ type Node interface {
 	// ConfState returns current node confstate.
 	ConfState() raftpb.ConfState
 
+	// ConnectToNodes actively establishes connections to the specified node IDs
+	ConnectToNodes(nodeIDs []uint64)
+
 	// Stop stops the Raft node and releases resources
 	Stop()
 }
